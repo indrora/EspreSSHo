@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Mokapot — JavaCard 3.0.5 applet build
+  Uses ant-javacard: https://github.com/martinpaljak/ant-javacard
+
+  Prerequisites:
+    Set the jckit property to your JavaCard SDK 3.0.5 kit directory:
+      ant -Djckit=/path/to/jckit build
+    or export JCKIT_HOME and omit the flag.
+
+  ant-javacard.jar is downloaded automatically on first build (skipexisting).
+
+  Build:   ant build
+  Install: gp --install build/mokapot.cap
+-->
+<project name="mokapot" default="build" basedir=".">
+
+    <!--
+      Resolve the JavaCard SDK path:
+        1. -Djckit=... on the command line
+        2. JCKIT_HOME environment variable
+    -->
+    <condition property="jckit.dir" value="${jckit}" else="${env.JCKIT_HOME}">
+        <isset property="jckit" />
+    </condition>
+
+    <property
+        name="ant.javacard.jar"
+        value="${basedir}/util/ant-javacard.jar"
+    />
+
+    <propery name="applet.aid" value="CA:FE:5H:07:00:01:00" />
+
+
+    <target name="fetch" description="Download ant-javacard.jar if not present">
+        <get
+            src="https://github.com/martinpaljak/ant-javacard/releases/latest/download/ant-javacard.jar"
+            dest="${basedir}/util/ant-javacard.jar"
+            skipexisting="true"
+        />
+    </target>
+
+    <target name="build" depends="fetch" description="Build mokapot.cap">
+        <taskdef
+            name="javacard"
+            classname="pro.javacard.ant.JavaCard"
+            classpath="${ant.javacard.jar}"
+        />
+        <javacard jckit="${jckit.dir}">
+            <cap
+                aid="${applet.aid}"
+                package="com.espressho.mokapot"
+                version="1.0"
+                output="${basedir}/build/mokapot-%v.cap"
+            >
+                <applet
+                    class="com.espressho.mokapot.SSHKeyApplet"
+                    aid="${applet.aid}"
+                />
+            </cap>
+            <cap
+                aid="${applet.aid}"
+                package="com.espressho.mokapot"
+                version="1.0"
+                output="${basedir}/build/mokapot-release-%v.cap"
+                strip="true"
+                debug="false"
+            >
+                <applet
+                    class="com.espressho.mokapot.SSHKeyApplet"
+                    aid="${applet.aid}"
+                />
+            </cap>
+
+        </javacard>
+    </target>
+
+    <target
+        name="clean"
+        description="Remove build output (leaves ant-javacard.jar)"
+    >
+        <delete dir="${basedir}/build" />
+    </target>
+
+</project>
