@@ -15,9 +15,10 @@ The core design goal is that private keys never leave the card. All signing oper
 
 ### Target Platform
 
-- JavaCard 3.0.5 / SDK25
+- JavaCard 3.0.5
 - ECC P-256 (`ALG_EC_FP`, 256-bit)
 - Standard JavaCard API only — no third-party dependencies
+- Applet AID: CA:FE:4D:6F:6B:61
 
 ### Key Storage
 
@@ -60,17 +61,20 @@ static final byte FLAG_ERASE_ON_LOCK = (byte)0x08;
 
 ### APDU Instruction Set
 
+All write operations use unified PIN-protected format for security and consistency.
+
 | INS | Byte | P1 | P2 | Data | Description |
 |---|---|---|---|---|---|
-| `INS_GEN_KEY` | `0x01` | slot (0–3) | — | — | Generate new keypair in slot |
+| `INS_GEN_KEY` | `0x01` | slot (0–3) | — | [PIN_LEN][PIN][FLAGS] | Generate new keypair in slot (requires PIN, fails if occupied) |
 | `INS_GET_PUBKEY` | `0x02` | slot (0–3) | — | — | Return raw EC public key |
 | `INS_SIGN` | `0x03` | slot (0–3) | flags | SHA-256 digest (32 bytes) | Sign digest, return DER signature |
 | `INS_LIST_KEYS` | `0x04` | — | — | — | Return populated slot bitmap |
 | `INS_VERIFY_PIN` | `0x05` | — | — | PIN bytes | Verify PIN |
 | `INS_CHANGE_PIN` | `0x06` | old PIN length | — | old PIN \|\| new PIN | Change PIN |
 | `INS_SET_FLAGS` | `0x07` | slot (0–3) | flags byte | — | Set per-key flags |
-| `INS_REGEN_KEY` | `0x08` | slot (0–3) | — | — | Regenerate keypair, returns new pubkey |
+| `INS_REGEN_KEY` | `0x08` | slot (0–3) | — | [PIN_LEN][PIN][FLAGS] | Regenerate keypair in slot (requires PIN) |
 | `INS_UNBLOCK_PIN` | `0x09` | PUK length | — | PUK \|\| new PIN | Unblock PIN using PUK |
+| `INS_CLEAR_KEY` | `0x0A` | slot (0–3) | — | [PIN_LEN][PIN][FLAGS] | Clear key and flags in slot (requires PIN) |
 
 ### SIGN Instruction Detail
 
@@ -79,13 +83,54 @@ static final byte FLAG_ERASE_ON_LOCK = (byte)0x08;
 - Returns DER-encoded ECDSA signature
 - Signer initialized as `ALG_ECDSA_SHA_256` — card does not re-hash
 
-### PIN Failure Status Words
+### Status Words
 
 | SW | Meaning |
 |---|---|
 | `0x9000` | Success |
+| `0x6982` | Security status not satisfied (PIN verification failed) |
 | `0x6983` | PIN blocked |
+| `0x6985` | Key slot already occupied (use REGEN_KEY to replace) |
+| `0x6A82` | Key slot not found (empty slot) |
 | `0x63Cx` | Wrong PIN, `x` tries remaining |
+
+### Unified PIN-Protected Operations
+
+GEN_KEY, REGEN_KEY, and CLEAR_KEY use a unified APDU format for consistency:
+
+```
+APDU Format: [PIN_LEN][PIN][FLAGS]
+```
+
+- **PIN_LEN**: 1 byte (range: 1-8)
+- **PIN**: Variable-length PIN data (1-8 bytes)
+- **FLAGS**: Security flags byte (see Flag Constants)
+
+**Examples:**
+```
+GEN_KEY with PIN "1234" and FLAG_REQUIRE_PIN:
+00 01 00 00 06 04 31 32 33 34 80
+
+CLEAR_KEY with PIN "test" and no flags:
+00 0A 01 00 05 04 74 65 73 74 00
+```
+
+### Security Model
+
+**Read Operations (No PIN Required):**
+- GET_PUBKEY: Returns public key for any populated slot
+- LIST_KEYS: Returns bitmap of occupied slots
+
+**Write Operations (PIN Required):**
+- GEN_KEY: Creates new key, fails if slot occupied
+- REGEN_KEY: Replaces existing key, explicitly sets flags
+- CLEAR_KEY: Securely deletes key and clears flags
+
+**Protection Features:**
+- **Slot Protection**: GEN_KEY prevents accidental overwrites
+- **Explicit Flags**: All operations set flags from APDU data
+- **Transaction Safety**: All operations are atomic
+- **PIN Enforcement**: All write operations require PIN verification
 
 ### ERASE_ON_LOCK Behavior
 
@@ -93,14 +138,21 @@ When the PIN becomes blocked (final failed attempt consumed), any slot with `FLA
 
 ---
 
-## Barista (Go SSH Agent)
-
 ### Dependencies
 
+**Go Dependencies (from go.mod):**
 ```
-golang.org/x/crypto/ssh/agent   // SSH agent interface and ServeAgent
-golang.org/x/term               // ReadPassword for PIN prompt
-github.com/ebfe/scard           // PC/SC smart card bindings
+github.com/ebfe/scard          // PC/SC smart card bindings  
+github.com/spf13/cobra         // CLI framework
+golang.org/x/crypto/ssh/agent  // SSH agent interface and ServeAgent
+golang.org/x/term              // ReadPassword for PIN prompt
+```
+
+**JavaCard Test Dependencies (from ivy.xml):**
+```
+com.github.martinpaljak/jcardengine  // JavaCard applet testing framework
+junit/junit                          // Unit testing framework
+org.hamcrest/hamcrest-core          // JUnit assertions
 ```
 
 ### SSH Agent Interface
@@ -203,30 +255,29 @@ Git sends the raw commit buffer; the SSH signing protocol handles hashing. Since
 
 ## Build Environment
 
-- **Mokapot:** JavaCard 3.0.5 / SDK25, Java 20, Gradle with `fr.bmartel.javacard` plugin
-- **Barista:** Go (current stable), `go mod`
-- **Card loading:** `gp` (GlobalPlatformPro JAR)
-- **Platform:** arm64 macOS — no known issues with this stack
+- **Mokapot:** JavaCard 3.0.5, Java 21+, Apache Ant with ant-javacard plugin
+- **Barista:** Go 1.23+, uses cobra CLI framework and scard for PC/SC
+- **Card loading:** GlobalPlatformPro (`gp` tool)  
+- **Build system:** just command runner
+- **Platform:** Cross-platform (developed on arm64 macOS)
 
 ---
 
-## Project Structure (Suggested)
+## Project Structure
 
 ```
 espressoho/
 ├── mokapot/                  # JavaCard applet
-│   ├── build.gradle
-│   └── src/main/java/
-│       └── com/espressoho/mokapot/
-│           ├── SSHKeyApplet.java
-│           ├── ECParams.java       # P-256 curve parameter constants
-│           └── APDUConstants.java
+│   ├── build.xml            # Ant build configuration
+│   ├── ivy.xml              # Dependency management
+│   └── src/
+│       ├── main/java/       # Applet source code
+│       └── test/java/       # JCardEngine unit tests
 └── barista/                  # Go SSH agent
-    ├── go.mod
-    ├── main.go
-    ├── agent.go              # CardAgent implementing ssh/agent.Agent
-    ├── card.go               # PC/SC communication, APDU helpers
-    ├── pin.go                # PIN prompt, verify, change, PUK
-    ├── keys.go               # Public key formatting, DER→SSH marshaling
-    └── flags.go              # Flag constants and needsPIN logic
+    ├── go.mod               # Go module definition
+    ├── main.go              # Entry point
+    ├── card/                # PC/SC communication layer
+    ├── sshagent/            # SSH agent implementation
+    ├── crypto/              # Cryptographic utilities
+    └── cmd/                 # Cobra CLI commands
 ```

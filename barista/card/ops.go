@@ -1,16 +1,94 @@
 package card
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/furrytel/espressoho/barista/crypto"
+)
+
+// encodePINProtectedAPDU builds the unified [PIN_LEN][PIN][FLAGS] format
+// used by GenKey, RegenKey, and ClearKey operations.
+func encodePINProtectedAPDU(ins byte, slot byte, pin []byte, flags byte) ([]byte, error) {
+	if len(pin) < 1 || len(pin) > 8 {
+		return nil, fmt.Errorf("PIN length must be 1-8 bytes, got %d", len(pin))
+	}
+	
+	pinLen := byte(len(pin))
+	dataLen := 1 + len(pin) + 1 // PIN_LEN + PIN + FLAGS
+	
+	apdu := make([]byte, 5+dataLen)
+	apdu[0] = 0x00           // CLA
+	apdu[1] = ins            // INS
+	apdu[2] = slot           // P1 = slot (0-3)
+	apdu[3] = 0x00           // P2 = reserved
+	apdu[4] = byte(dataLen)  // Lc = data length
+	apdu[5] = pinLen         // PIN_LEN
+	copy(apdu[6:], pin)      // PIN data
+	apdu[6+len(pin)] = flags // FLAGS (PIN_LEN + PIN + FLAGS)
+	
+	return apdu, nil
+}
 
 // GenKey generates a new EC P-256 keypair in the given slot (0–3).
-// Any existing key in that slot is replaced and its flags are cleared.
-func (card *Card) GenKey(slot byte) error {
-	apdu := []byte{0x00, INSGenKey, slot, 0x00, 0x00}
+// Requires PIN verification. Fails with ErrKeyExists if slot is occupied.
+// Use RegenKey to replace an existing key.
+func (card *Card) GenKey(slot byte, pin []byte, flags byte) error {
+	apdu, err := encodePINProtectedAPDU(INSGenKey, slot, pin, flags)
+	if err != nil {
+		return fmt.Errorf("GenKey slot %d: %w", slot, err)
+	}
+	
 	_, sw, err := card.transmit(apdu)
 	if err != nil {
 		return fmt.Errorf("GenKey slot %d: %w", slot, err)
 	}
 	return parseSW(sw)
+}
+
+// RegenKey regenerates the keypair in a slot (replaces existing key).
+// Requires PIN verification. Sets flags explicitly from the flags parameter.
+func (card *Card) RegenKey(slot byte, pin []byte, flags byte) error {
+	apdu, err := encodePINProtectedAPDU(INSRegenKey, slot, pin, flags)
+	if err != nil {
+		return fmt.Errorf("RegenKey slot %d: %w", slot, err)
+	}
+	
+	_, sw, err := card.transmit(apdu)
+	if err != nil {
+		return fmt.Errorf("RegenKey slot %d: %w", slot, err)
+	}
+	return parseSW(sw)
+}
+
+// ClearKey deletes a key from the given slot.
+// Requires PIN verification. The flags parameter is ignored but required for API consistency.
+func (card *Card) ClearKey(slot byte, pin []byte) error {
+	apdu, err := encodePINProtectedAPDU(INSClearKey, slot, pin, 0x00)
+	if err != nil {
+		return fmt.Errorf("ClearKey slot %d: %w", slot, err)
+	}
+	
+	_, sw, err := card.transmit(apdu)
+	if err != nil {
+		return fmt.Errorf("ClearKey slot %d: %w", slot, err)
+	}
+	return parseSW(sw)
+}
+
+// GetFlags returns the security flags byte for the given slot.
+func (card *Card) GetFlags(slot byte) (byte, error) {
+	apdu := []byte{0x00, INSGetFlags, slot, 0x00, 0x00}
+	resp, sw, err := card.transmit(apdu)
+	if err != nil {
+		return 0, fmt.Errorf("GetFlags slot %d: %w", slot, err)
+	}
+	if err := parseSW(sw); err != nil {
+		return 0, fmt.Errorf("GetFlags slot %d: %w", slot, err)
+	}
+	if len(resp) < 1 {
+		return 0, fmt.Errorf("GetFlags slot %d: empty response", slot)
+	}
+	return resp[0], nil
 }
 
 // GetPubKey returns the 65-byte uncompressed EC public key for the given slot.
@@ -25,7 +103,7 @@ func (card *Card) GetPubKey(slot byte) ([]byte, error) {
 	if err := parseSW(sw); err != nil {
 		return nil, fmt.Errorf("GetPubKey slot %d: %w", slot, err)
 	}
-	if len(resp) != 65 {
+	if len(resp) != crypto.ECPointLength {
 		return nil, fmt.Errorf("GetPubKey slot %d: unexpected response length %d", slot, len(resp))
 	}
 	return resp, nil
@@ -152,7 +230,8 @@ func (card *Card) UnblockPIN(puk, newPIN []byte) error {
 	return parseSW(sw)
 }
 
-// SetFlags sets the per-key policy flags for a slot.
+// SetFlags is deprecated in v2.0 — flags are set directly in write operations.
+// This function is kept for backward compatibility but will be removed in a future version.
 func (card *Card) SetFlags(slot byte, flags byte) error {
 	apdu := []byte{0x00, INSSetFlags, slot, flags, 0x00}
 	_, sw, err := card.transmit(apdu)
@@ -162,18 +241,4 @@ func (card *Card) SetFlags(slot byte, flags byte) error {
 	return parseSW(sw)
 }
 
-// RegenKey regenerates the keypair in a slot and returns the new public key.
-func (card *Card) RegenKey(slot byte) ([]byte, error) {
-	apdu := []byte{0x00, INSRegenKey, slot, 0x00, 0x00}
-	resp, sw, err := card.transmit(apdu)
-	if err != nil {
-		return nil, fmt.Errorf("RegenKey slot %d: %w", slot, err)
-	}
-	if err := parseSW(sw); err != nil {
-		return nil, fmt.Errorf("RegenKey slot %d: %w", slot, err)
-	}
-	if len(resp) != 65 {
-		return nil, fmt.Errorf("RegenKey slot %d: unexpected response length %d", slot, len(resp))
-	}
-	return resp, nil
-}
+

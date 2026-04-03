@@ -13,6 +13,10 @@ import (
 // readerFlag is the value of the persistent --reader flag, shared by all subcommands.
 var readerFlag string
 
+// pinFlag and pukFlag are values of the persistent --pin and --puk flags for CLI automation.
+var pinFlag string
+var pukFlag string
+
 // rootCmd is the top-level cobra command.
 var rootCmd = &cobra.Command{
 	Use:   "barista",
@@ -34,6 +38,16 @@ func init() {
 		&readerFlag,
 		"reader", "",
 		"PC/SC reader name or substring (default: first available reader)",
+	)
+	rootCmd.PersistentFlags().StringVar(
+		&pinFlag,
+		"pin", "",
+		"PIN for CLI automation (default: prompt user)",
+	)
+	rootCmd.PersistentFlags().StringVar(
+		&pukFlag,
+		"puk", "",
+		"PUK for CLI automation (default: prompt user)",
 	)
 
 	// readers subcommand — handy for discovering reader names.

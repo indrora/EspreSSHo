@@ -1,6 +1,6 @@
 # EspreSSHo Style Guide
 
-This guide applies to all code in this repository. Other AI assistants should read this
+This guide applies to all code in this repository. AI assistants should read this
 before making changes.
 
 ---
@@ -63,4 +63,4 @@ Follow BSD Kernel Normal Form brace style adapted for Java:
 ### Comments
 
 Non-trivial APDU logic should include a comment referencing the relevant section of the
-CLAUDE.md spec (e.g. `// SIGN instruction — CLAUDE.md §SIGN Instruction Detail`).
+project documentation (e.g. `// SIGN instruction — see CLAUDE.md §SIGN Instruction Detail`).

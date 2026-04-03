@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ivy-module version="2.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="http://ant.apache.org/ivy/schemas/ivy.xsd">
+    
+    <info organisation="com.espressho" module="mokapot" revision="1.0"/>
+    
+    <configurations>
+        <conf name="test" description="Test dependencies"/>
+        <conf name="default" description="Default configuration"/>
+    </configurations>
+    
+    <dependencies>
+        <!-- JCardEngine for JavaCard applet testing 
+             Modern replacement for jCardSim with better JavaCard 3.0.5 support -->
+        <dependency org="com.github.martinpaljak" name="jcardengine" rev="25.06.30-SNAPSHOT" conf="test->default"/>
+        
+        <!-- JUnit for unit testing -->
+        <dependency org="junit" name="junit" rev="4.13.2" conf="test->default"/>
+        
+        <!-- Hamcrest for JUnit assertions -->
+        <dependency org="org.hamcrest" name="hamcrest-core" rev="1.3" conf="test->default"/>
+    </dependencies>
+    
+</ivy-module>

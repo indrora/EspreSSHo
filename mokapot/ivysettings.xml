@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ivysettings>
+    <settings defaultResolver="default"/>
+    
+    <resolvers>
+        <chain name="default">
+            <!-- javacard.pro repository for JCardEngine -->
+            <ibiblio name="javacard-pro" 
+                     m2compatible="true"
+                     usepoms="true"
+                     root="https://mvn.javacard.pro/maven/" />
+            
+            <!-- javacard.pro SNAPSHOTS repository for JCardEngine -->
+            <ibiblio name="javacard-pro-snapshots" 
+                     m2compatible="true"
+                     usepoms="true"
+                     root="https://mvn.javacard.pro/maven/SNAPSHOTS/" />
+            
+            <!-- Maven Central repository for most dependencies -->
+            <ibiblio name="maven-central" 
+                     m2compatible="true"
+                     usepoms="true" />
+            
+            <!-- Maven2 layout repository -->
+            <ibiblio name="maven2" 
+                     m2compatible="true" 
+                     root="https://repo1.maven.org/maven2/" />
+        </chain>
+    </resolvers>
+</ivysettings>

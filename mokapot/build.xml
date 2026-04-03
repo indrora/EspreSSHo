@@ -1,38 +1,57 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <!--
-  Mokapot — JavaCard 3.0.5 applet build
+  Mokapot — JavaCard 3.0.5 applet build using SDK 3.2.0v25.1
   Uses ant-javacard: https://github.com/martinpaljak/ant-javacard
 
   Prerequisites:
-    Set the jckit property to your JavaCard SDK 3.0.5 kit directory:
-      ant -Djckit=/path/to/jckit build
-    or export JCKIT_HOME and omit the flag.
+    Set the JC_HOME environment variable to JavaCard SDK 3.2.0v25.1:
+      export JC_HOME=/path/to/jc320v25.1_kit
+    Initialize git submodules:
+      git submodule update --init --recursive
 
   ant-javacard.jar is downloaded automatically on first build (skipexisting).
 
   Build:   ant build
-  Install: gp --install build/mokapot.cap
+  Install: gp -install build/mokapot.cap
 -->
-<project name="mokapot" default="build" basedir=".">
-
-    <!--
-      Resolve the JavaCard SDK path:
-        1. -Djckit=... on the command line
-        2. JCKIT_HOME environment variable
-    -->
-    <condition property="jckit.dir" value="${jckit}" else="${env.JCKIT_HOME}">
-        <isset property="jckit" />
-    </condition>
+<project
+    name="mokapot"
+    default="build"
+    basedir="."
+    xmlns:ivy="antlib:org.apache.ivy.ant"
+>
 
     <property
         name="ant.javacard.jar"
         value="${basedir}/util/ant-javacard.jar"
     />
 
-    <propery name="applet.aid" value="CA:FE:5H:07:00:01:00" />
+    <property name="applet.rid" value="CAFE4D6F6B61" />
+    <property name="applet.aid" value="CAFE4D6F6B61000100000000000000" />
 
+    <!-- JavaCard SDK path from environment variable -->
+    <property name="jckit" value="${env.JC_HOME}" />
+
+
+    <taskdef
+        resource="org/apache/ivy/ant/antlib.xml"
+        uri="antlib:org.apache.ivy.ant"
+    >
+        <classpath>
+            <pathelement location="ivy/ivy-2.5.3.jar" />
+            <fileset dir="ivy/lib">
+                <include name="*.jar" />
+            </fileset>
+        </classpath>
+    </taskdef>
+
+
+
+    <!-- Test dependency directories -->
+    <property name="test.lib.dir" value="${basedir}/lib/test" />
 
     <target name="fetch" description="Download ant-javacard.jar if not present">
+        <mkdir dir="${basedir}/util" />
         <get
             src="https://github.com/martinpaljak/ant-javacard/releases/latest/download/ant-javacard.jar"
             dest="${basedir}/util/ant-javacard.jar"
@@ -40,15 +59,83 @@
         />
     </target>
 
+    <target
+        name="resolve-test"
+        description="Resolve test dependencies with Ivy"
+    >
+        <ivy:resolve conf="test" />
+        <ivy:cachepath pathid="test.classpath" conf="test" />
+        <ivy:retrieve
+            pattern="${test.lib.dir}/[artifact]-[revision].[ext]"
+            conf="test"
+        />
+    </target>
+
+    <!--
+      compile-tests: compiles applet sources + test sources against JCardEngine.
+      JCardEngine bundles the JavaCard API classes, so no separate SDK is needed
+      for test compilation — only for the cap-conversion build target above.
+    -->
+    <target
+        name="compile-tests"
+        depends="resolve-test"
+        description="Compile applet and test sources against JCardEngine"
+    >
+        <mkdir dir="${basedir}/build/test-classes" />
+        <!-- Applet sources compiled against JCardEngine's JavaCard API -->
+        <javac
+            srcdir="${basedir}/src/main/java"
+            destdir="${basedir}/build/test-classes"
+            includeantruntime="false"
+        >
+            <classpath refid="test.classpath" />
+        </javac>
+        <!-- Test sources compiled against JCardEngine + compiled applet classes -->
+        <javac
+            srcdir="${basedir}/src/test/java"
+            destdir="${basedir}/build/test-classes"
+            includeantruntime="false"
+        >
+            <classpath>
+                <path refid="test.classpath" />
+                <pathelement path="${basedir}/build/test-classes" />
+            </classpath>
+        </javac>
+    </target>
+
+    <!--
+      test: runs JUnit via JUnitCore (no ant-junit.jar required).
+      JCardEngine simulates the JavaCard runtime in-process.
+    -->
+    <target
+        name="test"
+        depends="compile-tests"
+        description="Run applet tests with JCardEngine"
+    >
+        <java
+            classname="org.junit.runner.JUnitCore"
+            fork="true"
+            failonerror="true"
+        >
+            <classpath>
+                <path refid="test.classpath" />
+                <pathelement path="${basedir}/build/test-classes" />
+            </classpath>
+            <arg value="com.espressho.mokapot.SSHKeyAppletTest" />
+        </java>
+    </target>
+
     <target name="build" depends="fetch" description="Build mokapot.cap">
+        <mkdir dir="${basedir}/build" />
         <taskdef
             name="javacard"
             classname="pro.javacard.ant.JavaCard"
             classpath="${ant.javacard.jar}"
         />
-        <javacard jckit="${jckit.dir}">
+        <javacard jckit="${jckit}">
             <cap
-                aid="${applet.aid}"
+                targetsdk="3.0.5"
+                aid="${applet.rid}"
                 package="com.espressho.mokapot"
                 version="1.0"
                 output="${basedir}/build/mokapot-%v.cap"
@@ -59,12 +146,14 @@
                 />
             </cap>
             <cap
-                aid="${applet.aid}"
+                aid="${applet.rid}"
+                targetsdk="3.0.5"
                 package="com.espressho.mokapot"
                 version="1.0"
                 output="${basedir}/build/mokapot-release-%v.cap"
                 strip="true"
                 debug="false"
+                jckit="${jckit}"
             >
                 <applet
                     class="com.espressho.mokapot.SSHKeyApplet"
@@ -75,11 +164,14 @@
         </javacard>
     </target>
 
-    <target
-        name="clean"
-        description="Remove build output (leaves ant-javacard.jar)"
-    >
+    <target name="clean-ivy" description="Clean ivy cache and dependencies">
+        <ivy:cleancache />
+        <delete dir="${test.lib.dir}" />
+    </target>
+
+    <target name="clean" description="Remove build output and dependencies">
         <delete dir="${basedir}/build" />
+        <delete dir="${test.lib.dir}" />
     </target>
 
 </project>

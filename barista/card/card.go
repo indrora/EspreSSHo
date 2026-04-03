@@ -3,15 +3,20 @@ package card
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/ebfe/scard"
+
+	"github.com/furrytel/espressoho/barista/crypto"
 )
 
 // Card wraps an scard.Card connected to the Mokapot applet.
 // Obtain one via Connect; release with Close when done.
+// All operations are thread-safe through an internal mutex.
 type Card struct {
 	ctx    *scard.Context
 	handle *scard.Card
+	mu     sync.Mutex // Protects PC/SC transmit operations from concurrent access
 }
 
 // Connect establishes a PC/SC connection to a reader and selects the Mokapot applet.
@@ -79,7 +84,11 @@ func (card *Card) Close() {
 }
 
 // transmit sends a raw APDU byte slice and returns the response body and SW.
+// This method is thread-safe.
 func (card *Card) transmit(apdu []byte) ([]byte, uint16, error) {
+	card.mu.Lock()
+	defer card.mu.Unlock()
+	
 	resp, err := card.handle.Transmit(apdu)
 	if err != nil {
 		return nil, 0, fmt.Errorf("transmit APDU: %w", err)
@@ -99,7 +108,10 @@ func (card *Card) selectApplet() error {
 	if err != nil {
 		return err
 	}
-	return parseSW(sw)
+	if sw != crypto.APDUSuccess {
+		return fmt.Errorf("applet selection failed with status word: 0x%04X", sw)
+	}
+	return nil
 }
 
 // pickReader returns the first reader whose name contains readerName (case-insensitive).

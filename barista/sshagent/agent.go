@@ -4,8 +4,6 @@
 package sshagent
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/sha256"
 	"encoding/asn1"
 	"errors"
@@ -13,6 +11,7 @@ import (
 	"math/big"
 	"os"
 	"os/exec"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -20,6 +19,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/furrytel/espressoho/barista/card"
+	"github.com/furrytel/espressoho/barista/crypto"
 )
 
 // keySlot caches the SSH public key and PIN state for one card slot.
@@ -34,9 +34,11 @@ type keySlot struct {
 //
 // Use New to create one; the card must already be connected and have its applet
 // selected. Call agent.ServeAgent(cardAgent, conn) to handle an SSH agent session.
+// All operations are thread-safe.
 type CardAgent struct {
 	cardConn *card.Card
 	slots    [4]keySlot
+	mu       sync.RWMutex // Protects slots array and PIN state
 }
 
 // New creates a CardAgent and loads public keys from all populated card slots.
@@ -51,6 +53,9 @@ func New(cardConn *card.Card) (*CardAgent, error) {
 // refreshSlots re-reads the slot bitmask and public keys from the card.
 // Called at startup and whenever a PIN-block event might have erased keys.
 func (agentInstance *CardAgent) refreshSlots() error {
+	agentInstance.mu.Lock()
+	defer agentInstance.mu.Unlock()
+	
 	mask, err := agentInstance.cardConn.ListSlots()
 	if err != nil {
 		return err
@@ -64,12 +69,25 @@ func (agentInstance *CardAgent) refreshSlots() error {
 		if err != nil {
 			return fmt.Errorf("get pubkey slot %d: %w", slotIndex, err)
 		}
-		sshKey, err := ecPointToSSHKey(rawPubKey)
+		sshKey, err := crypto.RawPointToSSHPublicKey(rawPubKey)
 		if err != nil {
 			return fmt.Errorf("parse pubkey slot %d: %w", slotIndex, err)
 		}
+		
+		// Load flags for this slot
+		flags, err := agentInstance.cardConn.GetFlags(slotIndex)
+		if err != nil {
+			return fmt.Errorf("get flags slot %d: %w", slotIndex, err)
+		}
+		
 		// Preserve PIN state across a refresh so a freshly-verified session isn't lost.
-		agentInstance.slots[slotIndex].publicKey = sshKey
+		oldSlot := agentInstance.slots[slotIndex]
+		agentInstance.slots[slotIndex] = keySlot{
+			publicKey:   sshKey,
+			flags:       flags,
+			pinVerified: oldSlot.pinVerified,
+			lastPINTime: oldSlot.lastPINTime,
+		}
 	}
 	return nil
 }
@@ -80,6 +98,9 @@ func (agentInstance *CardAgent) refreshSlots() error {
 
 // List returns all currently populated key slots as agent.Key entries.
 func (agentInstance *CardAgent) List() ([]*agent.Key, error) {
+	agentInstance.mu.RLock()
+	defer agentInstance.mu.RUnlock()
+	
 	var keys []*agent.Key
 	for slotIndex, slot := range agentInstance.slots {
 		if slot.publicKey == nil {
@@ -152,6 +173,9 @@ func (agentInstance *CardAgent) Signers() ([]ssh.Signer, error) { return nil, er
 //  3. If timeout bits == 0 → session-scoped, already verified → no PIN.
 //  4. If time since last verification > timeout → need PIN.
 func (agentInstance *CardAgent) needsPIN(slotIndex byte) bool {
+	agentInstance.mu.RLock()
+	defer agentInstance.mu.RUnlock()
+	
 	slot := agentInstance.slots[slotIndex]
 	if slot.flags&card.FlagRequirePIN == 0 {
 		return false
@@ -179,8 +203,10 @@ func (agentInstance *CardAgent) promptAndVerifyPIN(slotIndex byte) error {
 		return err
 	}
 
+	agentInstance.mu.Lock()
 	agentInstance.slots[slotIndex].pinVerified = true
 	agentInstance.slots[slotIndex].lastPINTime = time.Now()
+	agentInstance.mu.Unlock()
 	return nil
 }
 
@@ -225,6 +251,9 @@ func zeroBytes(buf []byte) {
 
 // findSlot returns the slot index whose public key matches key, and whether one was found.
 func (agentInstance *CardAgent) findSlot(key ssh.PublicKey) (byte, bool) {
+	agentInstance.mu.RLock()
+	defer agentInstance.mu.RUnlock()
+	
 	target := key.Marshal()
 	for slotIndex, slot := range agentInstance.slots {
 		if slot.publicKey != nil && string(slot.publicKey.Marshal()) == string(target) {
@@ -232,24 +261,6 @@ func (agentInstance *CardAgent) findSlot(key ssh.PublicKey) (byte, bool) {
 		}
 	}
 	return 0, false
-}
-
-// ecPointToSSHKey converts a raw 65-byte uncompressed EC point (04 || X || Y)
-// into an ssh.PublicKey for the ecdsa-sha2-nistp256 algorithm.
-func ecPointToSSHKey(rawPoint []byte) (ssh.PublicKey, error) {
-	if len(rawPoint) != 65 || rawPoint[0] != 0x04 {
-		return nil, fmt.Errorf("invalid uncompressed EC point (length %d)", len(rawPoint))
-	}
-	x := new(big.Int).SetBytes(rawPoint[1:33])
-	y := new(big.Int).SetBytes(rawPoint[33:65])
-
-	// ssh.NewPublicKey accepts *ecdsa.PublicKey directly.
-	ecKey := &ecdsa.PublicKey{
-		Curve: elliptic.P256(),
-		X:     x,
-		Y:     y,
-	}
-	return ssh.NewPublicKey(ecKey)
 }
 
 // ecdsaDERSignature is the ASN.1 structure returned by the card.

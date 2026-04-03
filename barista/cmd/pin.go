@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -23,19 +25,19 @@ var pinChangeCmd = &cobra.Command{
 	Short: "Change the card PIN",
 	Long:  "Prompts for the current PIN and the desired new PIN, then updates the card.",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		oldPIN, err := promptPIN("Current PIN: ")
+		oldPIN, err := promptHiddenString("Current PIN: ")
 		if err != nil {
 			return err
 		}
 		defer zeroSlice(oldPIN)
 
-		newPIN, err := promptPIN("New PIN: ")
+		newPIN, err := promptHiddenString("New PIN: ")
 		if err != nil {
 			return err
 		}
 		defer zeroSlice(newPIN)
 
-		confirm, err := promptPIN("Confirm new PIN: ")
+		confirm, err := promptHiddenString("Confirm new PIN: ")
 		if err != nil {
 			return err
 		}
@@ -64,19 +66,19 @@ var pinUnblockCmd = &cobra.Command{
 	Short: "Unblock a blocked PIN using the PUK",
 	Long:  "Prompts for the PUK and a new PIN, then unblocks and resets the card PIN.",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		puk, err := promptPIN("PUK: ")
+		puk, err := promptHiddenString("PUK: ")
 		if err != nil {
 			return err
 		}
 		defer zeroSlice(puk)
 
-		newPIN, err := promptPIN("New PIN: ")
+		newPIN, err := promptHiddenString("New PIN: ")
 		if err != nil {
 			return err
 		}
 		defer zeroSlice(newPIN)
 
-		confirm, err := promptPIN("Confirm new PIN: ")
+		confirm, err := promptHiddenString("Confirm new PIN: ")
 		if err != nil {
 			return err
 		}
@@ -100,18 +102,27 @@ var pinUnblockCmd = &cobra.Command{
 	},
 }
 
-// promptPIN reads a PIN from the terminal without echo.
-func promptPIN(prompt string) ([]byte, error) {
-	tty, err := os.Open("/dev/tty")
-	if err != nil {
-		return nil, fmt.Errorf("open /dev/tty: %w", err)
+// promptHiddenString reads a PIN from CLI flag if set, otherwise uses SSH_ASKPASS or terminal.
+func promptHiddenString(prompt string) ([]byte, error) {
+	// Check CLI flag first
+	if pinFlag != "" {
+		return []byte(pinFlag), nil
 	}
-	defer tty.Close()
 
-	fmt.Fprint(tty, prompt)
-	pin, err := term.ReadPassword(int(tty.Fd()))
-	fmt.Fprintln(tty)
-	return pin, err
+	// Fall back to SSH_ASKPASS pattern
+	askpass := os.Getenv("SSH_ASKPASS")
+	if askpass != "" {
+		out, err := exec.Command(askpass, prompt).Output()
+		if err != nil {
+			return nil, err
+		}
+		// Trim trailing newline that most askpass helpers append
+		return bytes.TrimRight(out, "\n"), nil
+	}
+
+	// Fall back to terminal prompt
+	fmt.Fprint(os.Stderr, prompt)
+	return term.ReadPassword(int(os.Stdin.Fd()))
 }
 
 // zeroSlice overwrites a byte slice with zeros.
