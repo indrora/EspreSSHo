@@ -9,6 +9,7 @@ This is a condensed guide to get you up and running with the Mokapot applet in 5
 - Your programming language of choice
 
 ### Tested Hardware Platforms
+
 - Real JavaCard hardware (P-256 compatibility, development ready)
 - Physical smart card readers via PC/SC
 - ⚠️ JavaCard simulators (compatibility mode, ~32% test success)
@@ -18,11 +19,11 @@ This is a condensed guide to get you up and running with the Mokapot applet in 5
 **Applet AID**: `CAFE4D6F6B61000100000000000000` ("CafeMoka")
 **Default PIN**: none — you set it with `CARD_INIT` (0x7F) on first use
 **Default PUK**: none — you set it with `CARD_INIT` (0x7F) on first use
-**API Version**: v2.0 (admin block + initialization gate)
 
 ## 5-Step Workflow
 
 ### 1. Wake Up the Applet
+
 ```
 SELECT: 00 A4 04 00 10 CA FE 4D 6F 6B 61 00 01 00 00 00 00 00 00 00 00
 ```
@@ -46,6 +47,7 @@ Response: 90 00
 If the card is already initialized, this returns `69 82`. That's fine — skip to step 3.
 
 ### 3. Create a Key
+
 ```
 GENERATE: 00 01 00 00 06 04 31 32 33 34 80
           │  │  │  │  │  │  └─ PIN bytes (1234) ─┘ └─ FLAGS (0x80)
@@ -60,6 +62,7 @@ Response: 04[64 bytes public key]90 00  (immediate public key return!)
 ```
 
 ### 4. Sign Something
+
 ```bash
 # Hash your data with SHA-256 first!
 echo "Hello, World!" | openssl dgst -sha256 -binary > hash.bin
@@ -70,6 +73,7 @@ Response: [DER signature] 90 00
 ```
 
 ### 5. Get Public Key (if needed separately)
+
 ```
 GET PUBKEY: 00 02 00 00
 Response: 04 [32-byte X] [32-byte Y] 90 00
@@ -123,6 +127,7 @@ print(f"Signature: {toHexString(sig_resp)}")
 ## Common Operations
 
 ### Fill All 4 Slots
+
 ```bash
 gp --apdu 00A4040010CAFE4D6F6B61000100000000000000 \
    --apdu 00A004080C31323334313233343536373839  \  # CARD_INIT (first time)
@@ -133,6 +138,7 @@ gp --apdu 00A4040010CAFE4D6F6B61000100000000000000 \
 ```
 
 ### Replace Existing Key
+
 ```bash
 # Use REGEN_KEY (0x06) for occupied slots
 gp --apdu 00A4040010CAFE4D6F6B61000100000000000000 \
@@ -140,27 +146,33 @@ gp --apdu 00A4040010CAFE4D6F6B61000100000000000000 \
 ```
 
 ### Clear a Key
+
 ```bash
 gp --apdu 00A4040010CAFE4D6F6B61000100000000000000 \
    --apdu 000700000604313233340000                   # clear slot 0
 ```
 
 ### Factory Reset (locked out)
-```bash
+
+```
 # Phase 1: get nonce
-gp --apdu 00A4040010CAFE4D6F6B61000100000000000000 \
-   --apdu 00A4000000                                 # returns 16-byte nonce
+>>> 00A4040010CAFE4D6F6B61000100000000000000 \
+>>> 00A4000000                                 # returns 16-byte nonce
+<<< [16 bytes of nonce]
 
 # Phase 2: confirm reset with the nonce bytes
-gp --apdu 00A40000 10 <nonce bytes here>
+>>> 00A40000 10 <nonce bytes here>
+<<< [nothing/OK]
 
 # Re-initialize
-gp --apdu 00A004080C31323334313233343536373839
+>>> 00A004080C31323334313233343536373839
+<<< 9000
 ```
 
 ## Key Features
 
 ### Security
+
 - **No Default Credentials**: PIN and PUK are set explicitly on first use
 - **Initialization Gate**: Uninitialized cards reject all instructions except CARD_INIT
 - **PIN Protection**: All write operations require PIN verification
@@ -168,6 +180,7 @@ gp --apdu 00A004080C31323334313233343536373839
 - **Atomic Operations**: Key generation and flag setting are transactional
 
 ### Usability
+
 - **Immediate Public Keys**: GEN_KEY and REGEN_KEY return the generated public key
 - **Factory Reset**: Two-phase credential-free reset for lockout recovery
 - **Separate PUK Management**: Change PUK independently via SET_PUK (0x7D)
@@ -182,6 +195,7 @@ gp --apdu 00A004080C31323334313233343536373839
 6. **Reset is credential-free** — Protect physical card access; anyone with the card can factory reset it
 
 ### Hardware vs Simulator
+
 - **Real Hardware**: P-256 success rate, ~125ms key generation
 - ⚠️ **Simulators**: ~32% success due to environment limitations (expected)
 - **Recommendation**: Use real JavaCard hardware for reliable operation
@@ -197,24 +211,7 @@ gp --apdu 00A004080C31323334313233343536373839
 - `6A 80` — Invalid flags (reserved bits set)
 - `67 00` — Wrong length (invalid APDU format)
 
-## Migration from v1.x
-
-Key changes to update in your code:
-
-```python
-# Old v1.x instruction bytes
-INS_REGEN_KEY   = 0x08  # → 0x06
-INS_CLEAR_KEY   = 0x0A  # → 0x07
-INS_GET_FLAGS   = 0x11  # → 0x08
-INS_CHANGE_PIN  = 0x06  # → 0x7E (INS_SET_PIN)
-INS_UNBLOCK_PIN = 0x09  # → 0x7C (INS_UNBLOCK_CARD)
-# INS_SET_FLAGS (0x07) removed entirely
-
-# New: must call CARD_INIT before any key operations on a fresh card
-init_cmd = [0x00, 0x7F, len(pin), len(puk), len(pin)+len(puk)] + list(pin) + list(puk)
-```
-
-## Next Steps
+## Next steps
 
 - Read the full [APPLET_API.md](APPLET_API.md) for complete command reference
 - Check [APDU-Protocol-Specification.md](APDU-Protocol-Specification.md) for protocol details

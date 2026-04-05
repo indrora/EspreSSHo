@@ -52,12 +52,12 @@ public class SSHKeyApplet extends Applet {
     // Limits
     // =========================================================================
 
-    private static final byte  MAX_KEYS        = (byte)  4;
-    private static final byte  PIN_MAX_TRIES   = (byte)  3;
-    private static final byte  PUK_MAX_TRIES   = (byte)  5;
-    private static final byte  PIN_MAX_LEN     = (byte)  8;
-    private static final byte  PUK_MAX_LEN     = (byte)  8;
-    private static final short PUBKEY_LEN      = (short) 65;
+    private static final byte MAX_KEYS = (byte) 4;
+    private static final byte PIN_MAX_TRIES = (byte) 3;
+    private static final byte PUK_MAX_TRIES = (byte) 5;
+    private static final byte PIN_MAX_LEN = (byte) 8;
+    private static final byte PUK_MAX_LEN = (byte) 8;
+    private static final short PUBKEY_LEN = (short) 65;
     /** Length of the factory-reset confirmation nonce in bytes. */
     private static final short RESET_NONCE_LEN = (short) 16;
 
@@ -119,6 +119,8 @@ public class SSHKeyApplet extends Applet {
     // Constructor / install
     // =========================================================================
 
+    // In this case, we don't care about the escale chance -- we're never going to be subclassed
+    @java.lang.SuppressWarnings({ "all", "this-escape" })
     protected SSHKeyApplet() {
         // PIN and PUK objects must be allocated at install time (EEPROM slots).
         // Credentials are NOT set here — they are established by INS_CARD_INIT.
@@ -131,10 +133,16 @@ public class SSHKeyApplet extends Applet {
         // initialized defaults to false (EEPROM boolean zero-initialisation).
 
         signer = Signature.getInstance(Signature.ALG_ECDSA_SHA_256, false);
-        rng    = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
+        rng = RandomData.getInstance(RandomData.ALG_TRNG);
 
-        pubKeyScratch = JCSystem.makeTransientByteArray(PUBKEY_LEN,      JCSystem.CLEAR_ON_DESELECT);
-        resetNonce    = JCSystem.makeTransientByteArray(RESET_NONCE_LEN, JCSystem.CLEAR_ON_DESELECT);
+        pubKeyScratch = JCSystem.makeTransientByteArray(
+            PUBKEY_LEN,
+            JCSystem.CLEAR_ON_DESELECT
+        );
+        resetNonce = JCSystem.makeTransientByteArray(
+            RESET_NONCE_LEN,
+            JCSystem.CLEAR_ON_DESELECT
+        );
 
         register();
     }
@@ -164,7 +172,7 @@ public class SSHKeyApplet extends Applet {
         // Gate: every instruction except INS_CARD_INIT requires initialization.
         // An uninitialized card only accepts SELECT (handled above) and CARD_INIT.
         if (!initialized && ins != APDUConstants.INS_CARD_INIT) {
-            ISOException.throwIt(APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED);
+            ISOException.throwIt(ISO7816.SW_COMMAND_NOT_ALLOWED);
         }
 
         switch (ins) {
@@ -247,14 +255,18 @@ public class SSHKeyApplet extends Applet {
         }
 
         if (!pin.check(buf, (short) (ISO7816.OFFSET_CDATA + 1), pinLen)) {
-            ISOException.throwIt(APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED);
+            ISOException.throwIt(
+                APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED
+            );
         }
 
         // Refuse to silently overwrite an existing key.
         try {
-            if (keyPairs[slot] != null &&
+            if (
+                keyPairs[slot] != null &&
                 keyPairs[slot].getPrivate() != null &&
-                keyPairs[slot].getPrivate().isInitialized()) {
+                keyPairs[slot].getPrivate().isInitialized()
+            ) {
                 ISOException.throwIt(APDUConstants.SW_KEY_EXISTS);
             }
         } catch (ISOException iso) {
@@ -303,7 +315,7 @@ public class SSHKeyApplet extends Applet {
      */
     private void handleSign(APDU apdu) {
         byte[] buf = apdu.getBuffer();
-        byte slot  = buf[ISO7816.OFFSET_P1];
+        byte slot = buf[ISO7816.OFFSET_P1];
         byte flags = buf[ISO7816.OFFSET_P2];
         checkSlot(slot);
         checkKeyPresent(slot);
@@ -324,8 +336,11 @@ public class SSHKeyApplet extends Applet {
         ECPrivateKey privKey = (ECPrivateKey) keyPairs[slot].getPrivate();
         signer.init(privKey, Signature.MODE_SIGN);
         short sigLen = signer.signPreComputedHash(
-            buf, ISO7816.OFFSET_CDATA, digestLen,
-            buf, (short) 0
+            buf,
+            ISO7816.OFFSET_CDATA,
+            digestLen,
+            buf,
+            (short) 0
         );
 
         apdu.setOutgoing();
@@ -340,7 +355,9 @@ public class SSHKeyApplet extends Applet {
     private void handleListKeys(APDU apdu) {
         byte mask = 0;
         for (byte i = 0; i < MAX_KEYS; i++) {
-            if (keyPairs[i] != null && keyPairs[i].getPrivate().isInitialized()) {
+            if (
+                keyPairs[i] != null && keyPairs[i].getPrivate().isInitialized()
+            ) {
                 mask |= (byte) (1 << i);
             }
         }
@@ -372,7 +389,8 @@ public class SSHKeyApplet extends Applet {
                 ISOException.throwIt(APDUConstants.SW_PIN_BLOCKED);
             }
             ISOException.throwIt(
-                (short) (APDUConstants.SW_WRONG_PIN_BASE | pin.getTriesRemaining())
+                (short) (APDUConstants.SW_WRONG_PIN_BASE |
+                    pin.getTriesRemaining())
             );
         }
         // Success — SW 9000 sent automatically.
@@ -407,7 +425,9 @@ public class SSHKeyApplet extends Applet {
         }
 
         if (!pin.check(buf, (short) (ISO7816.OFFSET_CDATA + 1), pinLen)) {
-            ISOException.throwIt(APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED);
+            ISOException.throwIt(
+                APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED
+            );
         }
 
         byte flags = buf[ISO7816.OFFSET_CDATA + 1 + pinLen];
@@ -457,7 +477,9 @@ public class SSHKeyApplet extends Applet {
         }
 
         if (!pin.check(buf, (short) (ISO7816.OFFSET_CDATA + 1), pinLen)) {
-            ISOException.throwIt(APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED);
+            ISOException.throwIt(
+                APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED
+            );
         }
 
         // FLAGS must be valid even though ignored, to keep the format honest.
@@ -519,7 +541,9 @@ public class SSHKeyApplet extends Applet {
     private void handleCardInit(APDU apdu) {
         if (initialized) {
             // Re-initialization is not permitted.
-            ISOException.throwIt(APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED);
+            ISOException.throwIt(
+                APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED
+            );
         }
 
         byte[] buf = apdu.getBuffer();
@@ -586,7 +610,8 @@ public class SSHKeyApplet extends Applet {
                 ISOException.throwIt(APDUConstants.SW_PIN_BLOCKED);
             }
             ISOException.throwIt(
-                (short) (APDUConstants.SW_WRONG_PIN_BASE | pin.getTriesRemaining())
+                (short) (APDUConstants.SW_WRONG_PIN_BASE |
+                    pin.getTriesRemaining())
             );
         }
 
@@ -629,7 +654,8 @@ public class SSHKeyApplet extends Applet {
 
         if (!puk.check(buf, ISO7816.OFFSET_CDATA, oldPUKLen)) {
             ISOException.throwIt(
-                (short) (APDUConstants.SW_WRONG_PIN_BASE | puk.getTriesRemaining())
+                (short) (APDUConstants.SW_WRONG_PIN_BASE |
+                    puk.getTriesRemaining())
             );
         }
 
@@ -672,7 +698,8 @@ public class SSHKeyApplet extends Applet {
 
         if (!puk.check(buf, ISO7816.OFFSET_CDATA, pukLen)) {
             ISOException.throwIt(
-                (short) (APDUConstants.SW_WRONG_PIN_BASE | puk.getTriesRemaining())
+                (short) (APDUConstants.SW_WRONG_PIN_BASE |
+                    puk.getTriesRemaining())
             );
         }
 
@@ -710,7 +737,7 @@ public class SSHKeyApplet extends Applet {
     private void handleResetCard(APDU apdu) {
         if (isResetNonceClear()) {
             // Phase 1: generate and return a fresh nonce.
-            rng.generateData(resetNonce, (short) 0, RESET_NONCE_LEN);
+            rng.nextBytes(resetNonce, (short) 0, RESET_NONCE_LEN);
 
             apdu.setOutgoing();
             apdu.setOutgoingLength(RESET_NONCE_LEN);
@@ -722,23 +749,46 @@ public class SSHKeyApplet extends Applet {
 
             if (dataLen != RESET_NONCE_LEN) {
                 // Wrong length — zero nonce immediately, no retries.
-                Util.arrayFillNonAtomic(resetNonce, (short) 0, RESET_NONCE_LEN, (byte) 0);
+                Util.arrayFillNonAtomic(
+                    resetNonce,
+                    (short) 0,
+                    RESET_NONCE_LEN,
+                    (byte) 0
+                );
                 ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
             }
 
             // Util.arrayCompare is constant-time on compliant JC implementations.
-            if (Util.arrayCompare(
-                    buf, ISO7816.OFFSET_CDATA,
-                    resetNonce, (short) 0,
-                    RESET_NONCE_LEN) != 0) {
+            if (
+                Util.arrayCompare(
+                    buf,
+                    ISO7816.OFFSET_CDATA,
+                    resetNonce,
+                    (short) 0,
+                    RESET_NONCE_LEN
+                ) !=
+                0
+            ) {
                 // Wrong nonce — zero immediately, no retries.
-                Util.arrayFillNonAtomic(resetNonce, (short) 0, RESET_NONCE_LEN, (byte) 0);
-                ISOException.throwIt(APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED);
+                Util.arrayFillNonAtomic(
+                    resetNonce,
+                    (short) 0,
+                    RESET_NONCE_LEN,
+                    (byte) 0
+                );
+                ISOException.throwIt(
+                    APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED
+                );
             }
 
             // Nonce verified — zero before the slow EEPROM writes so it
             // cannot be recovered if power is lost mid-reset.
-            Util.arrayFillNonAtomic(resetNonce, (short) 0, RESET_NONCE_LEN, (byte) 0);
+            Util.arrayFillNonAtomic(
+                resetNonce,
+                (short) 0,
+                RESET_NONCE_LEN,
+                (byte) 0
+            );
 
             // Atomically erase all key material and reset credentials.
             JCSystem.beginTransaction();
@@ -785,13 +835,22 @@ public class SSHKeyApplet extends Applet {
             KeyPair kp = null;
 
             try {
-                kp = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
+                kp = new KeyPair(
+                    KeyPair.ALG_EC_FP,
+                    KeyBuilder.LENGTH_EC_FP_256
+                );
                 ensureP256CurveInitialized(kp);
             } catch (Exception e) {
                 ECPrivateKey ecPrivKey = (ECPrivateKey) KeyBuilder.buildKey(
-                    KeyBuilder.TYPE_EC_FP_PRIVATE, KeyBuilder.LENGTH_EC_FP_256, false);
+                    KeyBuilder.TYPE_EC_FP_PRIVATE,
+                    KeyBuilder.LENGTH_EC_FP_256,
+                    false
+                );
                 ECPublicKey ecPubKey = (ECPublicKey) KeyBuilder.buildKey(
-                    KeyBuilder.TYPE_EC_FP_PUBLIC, KeyBuilder.LENGTH_EC_FP_256, false);
+                    KeyBuilder.TYPE_EC_FP_PUBLIC,
+                    KeyBuilder.LENGTH_EC_FP_256,
+                    false
+                );
 
                 if (ecPrivKey != null && ecPubKey != null) {
                     setP256CurveParams(ecPubKey, ecPrivKey);
@@ -808,8 +867,6 @@ public class SSHKeyApplet extends Applet {
         } catch (CryptoException ex) {
             switch (ex.getReason()) {
                 case CryptoException.ILLEGAL_USE:
-                    ISOException.throwIt(ISO7816.SW_COMMAND_NOT_ALLOWED);
-                    break;
                 case CryptoException.NO_SUCH_ALGORITHM:
                     ISOException.throwIt(ISO7816.SW_FUNC_NOT_SUPPORTED);
                     break;
@@ -830,7 +887,7 @@ public class SSHKeyApplet extends Applet {
 
     /** JCAlgTest-inspired curve initialization for the two-phase key build path. */
     private void ensureP256CurveInitialized(KeyPair ecKeyPair) {
-        ECPublicKey  ecPubKey  = (ECPublicKey)  ecKeyPair.getPublic();
+        ECPublicKey ecPubKey = (ECPublicKey) ecKeyPair.getPublic();
         ECPrivateKey ecPrivKey = (ECPrivateKey) ecKeyPair.getPrivate();
 
         try {
@@ -851,22 +908,54 @@ public class SSHKeyApplet extends Applet {
         byte[] auxBuffer = new byte[80];
         auxBuffer[0] = 0x04;
         short off = 1;
-        off = Util.arrayCopyNonAtomic(ECParams.P256_G_X, (short) 0, auxBuffer, off,
-                                      (short) ECParams.P256_G_X.length);
-        Util.arrayCopyNonAtomic(ECParams.P256_G_Y, (short) 0, auxBuffer, off,
-                                (short) ECParams.P256_G_Y.length);
-        short gSize = (short) (1 + ECParams.P256_G_X.length + ECParams.P256_G_Y.length);
+        off = Util.arrayCopyNonAtomic(
+            ECParams.P256_G_X,
+            (short) 0,
+            auxBuffer,
+            off,
+            (short) ECParams.P256_G_X.length
+        );
+        Util.arrayCopyNonAtomic(
+            ECParams.P256_G_Y,
+            (short) 0,
+            auxBuffer,
+            off,
+            (short) ECParams.P256_G_Y.length
+        );
+        short gSize = (short) (1 +
+            ECParams.P256_G_X.length +
+            ECParams.P256_G_Y.length);
 
-        pubKey.setFieldFP(ECParams.P256_P, (short) 0, (short) ECParams.P256_P.length);
-        privKey.setFieldFP(ECParams.P256_P, (short) 0, (short) ECParams.P256_P.length);
+        pubKey.setFieldFP(
+            ECParams.P256_P,
+            (short) 0,
+            (short) ECParams.P256_P.length
+        );
+        privKey.setFieldFP(
+            ECParams.P256_P,
+            (short) 0,
+            (short) ECParams.P256_P.length
+        );
         pubKey.setA(ECParams.P256_A, (short) 0, (short) ECParams.P256_A.length);
-        privKey.setA(ECParams.P256_A, (short) 0, (short) ECParams.P256_A.length);
+        privKey.setA(
+            ECParams.P256_A,
+            (short) 0,
+            (short) ECParams.P256_A.length
+        );
         pubKey.setB(ECParams.P256_B, (short) 0, (short) ECParams.P256_B.length);
-        privKey.setB(ECParams.P256_B, (short) 0, (short) ECParams.P256_B.length);
+        privKey.setB(
+            ECParams.P256_B,
+            (short) 0,
+            (short) ECParams.P256_B.length
+        );
         pubKey.setG(auxBuffer, (short) 0, gSize);
         privKey.setG(auxBuffer, (short) 0, gSize);
         pubKey.setR(ECParams.P256_R, (short) 0, (short) ECParams.P256_R.length);
-        privKey.setR(ECParams.P256_R, (short) 0, (short) ECParams.P256_R.length);
+        privKey.setR(
+            ECParams.P256_R,
+            (short) 0,
+            (short) ECParams.P256_R.length
+        );
         pubKey.setK(ECParams.P256_K);
         privKey.setK(ECParams.P256_K);
     }
@@ -894,8 +983,10 @@ public class SSHKeyApplet extends Applet {
         JCSystem.beginTransaction();
         try {
             for (byte i = 0; i < MAX_KEYS; i++) {
-                if ((keyFlags[i] & APDUConstants.FLAG_ERASE_ON_LOCK) != 0 &&
-                    keyPairs[i] != null) {
+                if (
+                    (keyFlags[i] & APDUConstants.FLAG_ERASE_ON_LOCK) != 0 &&
+                    keyPairs[i] != null
+                ) {
                     keyPairs[i].getPrivate().clearKey();
                     keyPairs[i].getPublic().clearKey();
                 }
@@ -928,7 +1019,10 @@ public class SSHKeyApplet extends Applet {
 
     /** Throw SW_KEY_NOT_FOUND if the slot has no initialized private key. */
     private void checkKeyPresent(byte slot) {
-        if (keyPairs[slot] == null || !keyPairs[slot].getPrivate().isInitialized()) {
+        if (
+            keyPairs[slot] == null ||
+            !keyPairs[slot].getPrivate().isInitialized()
+        ) {
             ISOException.throwIt(APDUConstants.SW_KEY_NOT_FOUND);
         }
     }

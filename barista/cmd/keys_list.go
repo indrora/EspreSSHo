@@ -7,8 +7,8 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/furrytel/espressoho/barista/card"
-	"github.com/furrytel/espressoho/barista/crypto"
+	"github.com/indrora/EspreSSHo/barista/card"
+	"github.com/indrora/EspreSSHo/barista/crypto"
 )
 
 var keysListCmd = &cobra.Command{
@@ -69,7 +69,7 @@ Use --verbose for detailed information or --quiet for just the public keys.`,
 					fmt.Printf("slot %d: error reading flags: %v\n", slotIndex, err)
 					continue
 				}
-				
+
 				fmt.Printf("Slot %d:\n", slotIndex)
 				fmt.Printf("  Flags: 0x%02X", flags)
 				if flags&card.FlagRequirePIN != 0 {
@@ -87,8 +87,27 @@ Use --verbose for detailed information or --quiet for just the public keys.`,
 				fmt.Printf("  Fingerprint: %s\n", ssh.FingerprintSHA256(sshKey))
 				fmt.Printf("  Public key: %s\n", formatSSHPublicKey(sshKey, slotIndex))
 			} else {
-				// Default: public key + fingerprint
-				fmt.Printf("%s  # %s\n", 
+				// Default: show flags, fingerprint, and public key
+				flags, err := cardConn.GetFlags(slotIndex)
+				if err != nil {
+					fmt.Printf("slot %d: error reading flags: %v\n", slotIndex, err)
+					continue
+				}
+
+				fmt.Printf("Slot %d: flags=0x%02X", slotIndex, flags)
+				if flags&card.FlagRequirePIN != 0 {
+					timeout := (flags & card.FlagTimeoutMask) >> card.FlagTimeoutShift
+					if timeout == 0 {
+						fmt.Printf(" (PIN/session)")
+					} else {
+						fmt.Printf(" (PIN/%dmin)", timeout)
+					}
+				}
+				if flags&card.FlagEraseOnLock != 0 {
+					fmt.Printf(" (erase-on-lock)")
+				}
+				fmt.Printf("\n")
+				fmt.Printf("  %s  # %s\n",
 					formatSSHPublicKey(sshKey, slotIndex),
 					ssh.FingerprintSHA256(sshKey),
 				)

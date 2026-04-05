@@ -2,13 +2,6 @@
 <!--
   Mokapot — JavaCard 3.0.5 applet build using SDK 3.2.0v25.1
   Uses ant-javacard: https://github.com/martinpaljak/ant-javacard
-
-  Prerequisites:
-    Set the JC_HOME environment variable to JavaCard SDK 3.2.0v25.1:
-      export JC_HOME=/path/to/jc320v25.1_kit
-    Initialize git submodules:
-      git submodule update --init --recursive
-
   ant-javacard.jar is downloaded automatically on first build (skipexisting).
 
   Build:   ant build
@@ -132,7 +125,7 @@
             classname="pro.javacard.ant.JavaCard"
             classpath="${ant.javacard.jar}"
         />
-        <javacard jckit="${jckit}">
+        <javacard>
             <cap
                 targetsdk="3.0.5"
                 aid="${applet.rid}"
@@ -153,7 +146,6 @@
                 output="${basedir}/build/mokapot-release-%v.cap"
                 strip="true"
                 debug="false"
-                jckit="${jckit}"
             >
                 <applet
                     class="com.espressho.mokapot.SSHKeyApplet"

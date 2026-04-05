@@ -3,7 +3,7 @@ package card
 import (
 	"fmt"
 
-	"github.com/furrytel/espressoho/barista/crypto"
+	"github.com/indrora/EspreSSHo/barista/crypto"
 )
 
 // encodePINProtectedAPDU builds the unified [PIN_LEN][PIN][FLAGS] format
@@ -12,10 +12,10 @@ func encodePINProtectedAPDU(ins byte, slot byte, pin []byte, flags byte) ([]byte
 	if len(pin) < 1 || len(pin) > 8 {
 		return nil, fmt.Errorf("PIN length must be 1-8 bytes, got %d", len(pin))
 	}
-	
+
 	pinLen := byte(len(pin))
 	dataLen := 1 + len(pin) + 1 // PIN_LEN + PIN + FLAGS
-	
+
 	apdu := make([]byte, 5+dataLen)
 	apdu[0] = 0x00           // CLA
 	apdu[1] = ins            // INS
@@ -25,7 +25,7 @@ func encodePINProtectedAPDU(ins byte, slot byte, pin []byte, flags byte) ([]byte
 	apdu[5] = pinLen         // PIN_LEN
 	copy(apdu[6:], pin)      // PIN data
 	apdu[6+len(pin)] = flags // FLAGS (PIN_LEN + PIN + FLAGS)
-	
+
 	return apdu, nil
 }
 
@@ -37,7 +37,7 @@ func (card *Card) GenKey(slot byte, pin []byte, flags byte) error {
 	if err != nil {
 		return fmt.Errorf("GenKey slot %d: %w", slot, err)
 	}
-	
+
 	_, sw, err := card.transmit(apdu)
 	if err != nil {
 		return fmt.Errorf("GenKey slot %d: %w", slot, err)
@@ -52,7 +52,7 @@ func (card *Card) RegenKey(slot byte, pin []byte, flags byte) error {
 	if err != nil {
 		return fmt.Errorf("RegenKey slot %d: %w", slot, err)
 	}
-	
+
 	_, sw, err := card.transmit(apdu)
 	if err != nil {
 		return fmt.Errorf("RegenKey slot %d: %w", slot, err)
@@ -67,7 +67,7 @@ func (card *Card) ClearKey(slot byte, pin []byte) error {
 	if err != nil {
 		return fmt.Errorf("ClearKey slot %d: %w", slot, err)
 	}
-	
+
 	_, sw, err := card.transmit(apdu)
 	if err != nil {
 		return fmt.Errorf("ClearKey slot %d: %w", slot, err)
@@ -188,57 +188,156 @@ func (card *Card) VerifyPIN(pinBytes []byte) error {
 	return parseSW(sw)
 }
 
-// ChangePIN changes the card PIN. The old PIN must be provided.
-func (card *Card) ChangePIN(oldPIN, newPIN []byte) error {
-	if len(oldPIN) == 0 || len(newPIN) == 0 {
-		return fmt.Errorf("ChangePIN: PIN must not be empty")
+// CardInit performs one-time card initialization, setting PIN and PUK.
+// This is the only instruction accepted on an uninitialized card (besides SELECT).
+// APDU format: CLA INS P1_PIN_LEN P2_PUK_LEN Lc PIN||PUK
+func (card *Card) CardInit(pin, puk []byte) error {
+	if len(pin) < 1 || len(pin) > 8 {
+		return fmt.Errorf("CardInit: PIN length must be 1-8 bytes, got %d", len(pin))
 	}
-	payload := append(oldPIN, newPIN...)
-	apdu := make([]byte, 5+len(payload))
-	apdu[0] = 0x00
-	apdu[1] = INSChangePIN
-	apdu[2] = byte(len(oldPIN)) // P1 = old PIN length
-	apdu[3] = 0x00
-	apdu[4] = byte(len(payload))
-	copy(apdu[5:], payload)
+	if len(puk) < 1 || len(puk) > 8 {
+		return fmt.Errorf("CardInit: PUK length must be 1-8 bytes, got %d", len(puk))
+	}
+
+	dataLen := len(pin) + len(puk)
+	apdu := make([]byte, 5+dataLen)
+	apdu[0] = 0x00               // CLA
+	apdu[1] = INSCardInit        // INS
+	apdu[2] = byte(len(pin))     // P1 = PIN length
+	apdu[3] = byte(len(puk))     // P2 = PUK length
+	apdu[4] = byte(dataLen)      // Lc = total data length
+	copy(apdu[5:], pin)          // PIN bytes
+	copy(apdu[5+len(pin):], puk) // PUK bytes
 
 	_, sw, err := card.transmit(apdu)
 	if err != nil {
-		return fmt.Errorf("ChangePIN: %w", err)
+		return fmt.Errorf("CardInit: %w", err)
 	}
 	return parseSW(sw)
 }
 
-// UnblockPIN resets a blocked PIN using the PUK and sets a new PIN value.
-func (card *Card) UnblockPIN(puk, newPIN []byte) error {
-	if len(puk) == 0 || len(newPIN) == 0 {
-		return fmt.Errorf("UnblockPIN: PUK and new PIN must not be empty")
+// SetPIN changes the card PIN. Replaces the old ChangePIN function.
+// APDU format: CLA INS P1_OLD_LEN P2 Lc OLD_PIN||NEW_PIN
+// Does not require a prior VerifyPIN - the old PIN is verified inline.
+func (card *Card) SetPIN(oldPIN, newPIN []byte) error {
+	if len(oldPIN) < 1 || len(oldPIN) > 8 {
+		return fmt.Errorf("SetPIN: old PIN length must be 1-8 bytes, got %d", len(oldPIN))
 	}
-	payload := append(puk, newPIN...)
-	apdu := make([]byte, 5+len(payload))
-	apdu[0] = 0x00
-	apdu[1] = INSUnblockPIN
-	apdu[2] = byte(len(puk)) // P1 = PUK length
-	apdu[3] = 0x00
-	apdu[4] = byte(len(payload))
-	copy(apdu[5:], payload)
+	if len(newPIN) < 1 || len(newPIN) > 8 {
+		return fmt.Errorf("SetPIN: new PIN length must be 1-8 bytes, got %d", len(newPIN))
+	}
+
+	dataLen := len(oldPIN) + len(newPIN)
+	apdu := make([]byte, 5+dataLen)
+	apdu[0] = 0x00                     // CLA
+	apdu[1] = INSSetPIN                // INS
+	apdu[2] = byte(len(oldPIN))        // P1 = old PIN length
+	apdu[3] = 0x00                     // P2 = reserved
+	apdu[4] = byte(dataLen)            // Lc = total data length
+	copy(apdu[5:], oldPIN)             // Old PIN bytes
+	copy(apdu[5+len(oldPIN):], newPIN) // New PIN bytes
 
 	_, sw, err := card.transmit(apdu)
 	if err != nil {
-		return fmt.Errorf("UnblockPIN: %w", err)
+		return fmt.Errorf("SetPIN: %w", err)
 	}
 	return parseSW(sw)
 }
 
-// SetFlags is deprecated in v2.0 — flags are set directly in write operations.
-// This function is kept for backward compatibility but will be removed in a future version.
-func (card *Card) SetFlags(slot byte, flags byte) error {
-	apdu := []byte{0x00, INSSetFlags, slot, flags, 0x00}
+// SetPUK changes the card PUK.
+// APDU format: CLA INS P1_OLD_LEN P2 Lc OLD_PUK||NEW_PUK
+func (card *Card) SetPUK(oldPUK, newPUK []byte) error {
+	if len(oldPUK) < 1 || len(oldPUK) > 8 {
+		return fmt.Errorf("SetPUK: old PUK length must be 1-8 bytes, got %d", len(oldPUK))
+	}
+	if len(newPUK) < 1 || len(newPUK) > 8 {
+		return fmt.Errorf("SetPUK: new PUK length must be 1-8 bytes, got %d", len(newPUK))
+	}
+
+	dataLen := len(oldPUK) + len(newPUK)
+	apdu := make([]byte, 5+dataLen)
+	apdu[0] = 0x00                     // CLA
+	apdu[1] = INSSetPUK                // INS
+	apdu[2] = byte(len(oldPUK))        // P1 = old PUK length
+	apdu[3] = 0x00                     // P2 = reserved
+	apdu[4] = byte(dataLen)            // Lc = total data length
+	copy(apdu[5:], oldPUK)             // Old PUK bytes
+	copy(apdu[5+len(oldPUK):], newPUK) // New PUK bytes
+
 	_, sw, err := card.transmit(apdu)
 	if err != nil {
-		return fmt.Errorf("SetFlags slot %d: %w", slot, err)
+		return fmt.Errorf("SetPUK: %w", err)
 	}
 	return parseSW(sw)
 }
 
+// UnblockCard unblocks a blocked PIN using the PUK and sets a new PIN value.
+// Replaces the old UnblockPIN function.
+// APDU format: CLA INS P1_PUK_LEN P2 Lc PUK||NEW_PIN
+func (card *Card) UnblockCard(puk, newPIN []byte) error {
+	if len(puk) < 1 || len(puk) > 8 {
+		return fmt.Errorf("UnblockCard: PUK length must be 1-8 bytes, got %d", len(puk))
+	}
+	if len(newPIN) < 1 || len(newPIN) > 8 {
+		return fmt.Errorf("UnblockCard: new PIN length must be 1-8 bytes, got %d", len(newPIN))
+	}
 
+	dataLen := len(puk) + len(newPIN)
+	apdu := make([]byte, 5+dataLen)
+	apdu[0] = 0x00                  // CLA
+	apdu[1] = INSUnblockCard        // INS
+	apdu[2] = byte(len(puk))        // P1 = PUK length
+	apdu[3] = 0x00                  // P2 = reserved
+	apdu[4] = byte(dataLen)         // Lc = total data length
+	copy(apdu[5:], puk)             // PUK bytes
+	copy(apdu[5+len(puk):], newPIN) // New PIN bytes
+
+	_, sw, err := card.transmit(apdu)
+	if err != nil {
+		return fmt.Errorf("UnblockCard: %w", err)
+	}
+	return parseSW(sw)
+}
+
+// ResetCard performs a two-phase factory reset with user confirmation.
+// Phase 1: Get nonce from card
+// Phase 2: User must type last 4 hex bytes of nonce to confirm, then complete reset
+// Returns the last 4 hex bytes that user needs to type for confirmation.
+func (card *Card) ResetCardPhase1() ([]byte, error) {
+	apdu := []byte{0x00, INSResetCard, 0x00, 0x00, 0x00} // No data for phase 1
+	resp, sw, err := card.transmit(apdu)
+	if err != nil {
+		return nil, fmt.Errorf("ResetCard Phase1: %w", err)
+	}
+	if err := parseSW(sw); err != nil {
+		return nil, fmt.Errorf("ResetCard Phase1: %w", err)
+	}
+	if len(resp) != 16 {
+		return nil, fmt.Errorf("ResetCard Phase1: expected 16-byte nonce, got %d bytes", len(resp))
+	}
+
+	// Return the full nonce but caller should show last 4 bytes to user for confirmation
+	return resp, nil
+}
+
+// ResetCardPhase2 completes the factory reset using the nonce from Phase 1.
+// The nonce should be the full 16-byte nonce from Phase 1.
+func (card *Card) ResetCardPhase2(nonce []byte) error {
+	if len(nonce) != 16 {
+		return fmt.Errorf("ResetCard Phase2: nonce must be exactly 16 bytes, got %d", len(nonce))
+	}
+
+	apdu := make([]byte, 5+16)
+	apdu[0] = 0x00         // CLA
+	apdu[1] = INSResetCard // INS
+	apdu[2] = 0x00         // P1 = reserved
+	apdu[3] = 0x00         // P2 = reserved
+	apdu[4] = 0x10         // Lc = 16 bytes
+	copy(apdu[5:], nonce)  // 16-byte nonce
+
+	_, sw, err := card.transmit(apdu)
+	if err != nil {
+		return fmt.Errorf("ResetCard Phase2: %w", err)
+	}
+	return parseSW(sw)
+}

@@ -6,8 +6,8 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/furrytel/espressoho/barista/card"
-	"github.com/furrytel/espressoho/barista/crypto"
+	"github.com/indrora/EspreSSHo/barista/card"
+	"github.com/indrora/EspreSSHo/barista/crypto"
 )
 
 var statusCmd = &cobra.Command{
@@ -24,6 +24,24 @@ var statusCmd = &cobra.Command{
 			return err
 		}
 		defer cardConn.Close()
+
+		// Check if card is initialized
+		initialized, err := cardConn.IsInitialized()
+		if err != nil {
+			return fmt.Errorf("check card status: %w", err)
+		}
+
+		if !initialized {
+			fmt.Printf("Mokapot Card Status\n")
+			fmt.Printf("===================\n")
+			fmt.Printf("Reader: %s\n", readerFlag)
+			if readerFlag == "" {
+				fmt.Printf("Reader: (first available)\n")
+			}
+			fmt.Printf("Status: UNINITIALIZED\n\n")
+			fmt.Println("Card needs initialization. Use 'barista pin init' to set up PIN and PUK.")
+			return nil
+		}
 
 		// Get slot mask
 		mask, err := cardConn.ListSlots()
@@ -63,13 +81,12 @@ var statusCmd = &cobra.Command{
 				continue
 			}
 
-			// Get flags (temporarily disabled - operation may not exist on card yet)
-			// flags, err := cardConn.GetFlags(slotIndex)
-			// if err != nil {
-			//	fmt.Printf("Slot %d: error reading flags: %v\n", slotIndex, err)
-			//	continue
-			// }
-			flags := byte(0x80) // Assume PIN required for now
+			// Get flags using GetFlags function
+			flags, err := cardConn.GetFlags(slotIndex)
+			if err != nil {
+				fmt.Printf("Slot %d: error reading flags: %v\n", slotIndex, err)
+				continue
+			}
 
 			// Display slot info
 			fmt.Printf("Slot %d: occupied\n", slotIndex)

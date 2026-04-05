@@ -18,8 +18,8 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/term"
 
-	"github.com/furrytel/espressoho/barista/card"
-	"github.com/furrytel/espressoho/barista/crypto"
+	"github.com/indrora/EspreSSHo/barista/card"
+	"github.com/indrora/EspreSSHo/barista/crypto"
 )
 
 // keySlot caches the SSH public key and PIN state for one card slot.
@@ -55,7 +55,7 @@ func New(cardConn *card.Card) (*CardAgent, error) {
 func (agentInstance *CardAgent) refreshSlots() error {
 	agentInstance.mu.Lock()
 	defer agentInstance.mu.Unlock()
-	
+
 	mask, err := agentInstance.cardConn.ListSlots()
 	if err != nil {
 		return err
@@ -73,13 +73,13 @@ func (agentInstance *CardAgent) refreshSlots() error {
 		if err != nil {
 			return fmt.Errorf("parse pubkey slot %d: %w", slotIndex, err)
 		}
-		
+
 		// Load flags for this slot
 		flags, err := agentInstance.cardConn.GetFlags(slotIndex)
 		if err != nil {
 			return fmt.Errorf("get flags slot %d: %w", slotIndex, err)
 		}
-		
+
 		// Preserve PIN state across a refresh so a freshly-verified session isn't lost.
 		oldSlot := agentInstance.slots[slotIndex]
 		agentInstance.slots[slotIndex] = keySlot{
@@ -100,7 +100,7 @@ func (agentInstance *CardAgent) refreshSlots() error {
 func (agentInstance *CardAgent) List() ([]*agent.Key, error) {
 	agentInstance.mu.RLock()
 	defer agentInstance.mu.RUnlock()
-	
+
 	var keys []*agent.Key
 	for slotIndex, slot := range agentInstance.slots {
 		if slot.publicKey == nil {
@@ -154,12 +154,14 @@ func (agentInstance *CardAgent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signa
 
 // The following operations are not supported — Mokapot manages its own keys.
 
-func (agentInstance *CardAgent) Add(agent.AddedKey) error      { return errors.New("not supported") }
-func (agentInstance *CardAgent) Remove(ssh.PublicKey) error     { return errors.New("not supported") }
-func (agentInstance *CardAgent) RemoveAll() error               { return errors.New("not supported") }
-func (agentInstance *CardAgent) Lock([]byte) error              { return errors.New("not supported") }
-func (agentInstance *CardAgent) Unlock([]byte) error            { return errors.New("not supported") }
-func (agentInstance *CardAgent) Signers() ([]ssh.Signer, error) { return nil, errors.New("not supported") }
+func (agentInstance *CardAgent) Add(agent.AddedKey) error   { return errors.New("not supported") }
+func (agentInstance *CardAgent) Remove(ssh.PublicKey) error { return errors.New("not supported") }
+func (agentInstance *CardAgent) RemoveAll() error           { return errors.New("not supported") }
+func (agentInstance *CardAgent) Lock([]byte) error          { return errors.New("not supported") }
+func (agentInstance *CardAgent) Unlock([]byte) error        { return errors.New("not supported") }
+func (agentInstance *CardAgent) Signers() ([]ssh.Signer, error) {
+	return nil, errors.New("not supported")
+}
 
 // -------------------------------------------------------------------------
 // PIN helpers
@@ -175,7 +177,7 @@ func (agentInstance *CardAgent) Signers() ([]ssh.Signer, error) { return nil, er
 func (agentInstance *CardAgent) needsPIN(slotIndex byte) bool {
 	agentInstance.mu.RLock()
 	defer agentInstance.mu.RUnlock()
-	
+
 	slot := agentInstance.slots[slotIndex]
 	if slot.flags&card.FlagRequirePIN == 0 {
 		return false
@@ -253,7 +255,7 @@ func zeroBytes(buf []byte) {
 func (agentInstance *CardAgent) findSlot(key ssh.PublicKey) (byte, bool) {
 	agentInstance.mu.RLock()
 	defer agentInstance.mu.RUnlock()
-	
+
 	target := key.Marshal()
 	for slotIndex, slot := range agentInstance.slots {
 		if slot.publicKey != nil && string(slot.publicKey.Marshal()) == string(target) {

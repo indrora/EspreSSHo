@@ -1,4 +1,4 @@
-module github.com/furrytel/espressoho/barista
+module github.com/indrora/EspreSSHo/barista
 
 go 1.23
 

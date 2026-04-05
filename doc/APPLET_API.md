@@ -17,22 +17,10 @@ This document provides complete instructions for interacting with the EspreSSHo 
 - **Default PIN**: none — set by `INS_CARD_INIT` at first use
 - **Default PUK**: none — set by `INS_CARD_INIT` at first use
 
-## APDU Breaking Changes from v1.x
-
-**⚠️ BREAKING CHANGES (v2.0):**
-- No default PIN/PUK — `INS_CARD_INIT` must be called before anything else
-- `INS_CHANGE_PIN (0x06)` → `INS_SET_PIN (0x7E)`
-- `INS_UNBLOCK_PIN (0x09)` → `INS_UNBLOCK_CARD (0x7C)`
-- `INS_SET_FLAGS (0x07)` removed
-- `INS_REGEN_KEY` renumbered: 0x08 → 0x06
-- `INS_CLEAR_KEY` renumbered: 0x0A → 0x07
-- `INS_GET_FLAGS` renumbered: 0x11 → 0x08
-- New: `INS_SET_PUK (0x7D)`, `INS_RESET_CARD (0x7B)`
-- New: Initialization gate — uninitialized cards reject all instructions except SELECT and CARD_INIT
-
 ## APDU Command Format
 
 All commands use ISO 7816-4 format:
+
 ```
 CLA INS P1  P2  [Lc Data] [Le]
 00  xx  yy  zz  [nn ...] [ee]
@@ -51,41 +39,42 @@ CLA INS P1  P2  [Lc Data] [Le]
 
 All require the card to have been initialized via `INS_CARD_INIT`.
 
-| Command | INS | P1 | P2 | Data Format | Response | Description |
-|---------|-----|----|----|-------------|----------|-------------|
-| **Generate Key** | `0x01` | slot (0–3) | `0x00` | `[PIN_LEN][PIN][FLAGS]` | 65-byte public key | Create new EC P-256 keypair |
-| **Get Public Key** | `0x02` | slot (0–3) | `0x00` | — | 65 bytes | Uncompressed EC point |
-| **Sign** | `0x03` | slot (0–3) | flags | digest (1–128 bytes) | DER signature | Sign pre-computed digest |
-| **List Keys** | `0x04` | `0x00` | `0x00` | — | 1-byte bitmask | Get populated slots |
-| **Verify PIN** | `0x05` | `0x00` | `0x00` | PIN bytes | — | Authenticate user for session |
-| **Regenerate Key** | `0x06` | slot (0–3) | `0x00` | `[PIN_LEN][PIN][FLAGS]` | 65-byte public key | Replace existing key |
-| **Clear Key** | `0x07` | slot (0–3) | `0x00` | `[PIN_LEN][PIN][FLAGS]` | — | Delete key and flags |
-| **Get Flags** | `0x08` | slot (0–3) | `0x00` | — | 1-byte flags | Read per-key flags |
+| Command            | INS    | P1         | P2     | Data Format             | Response           | Description                   |
+| ------------------ | ------ | ---------- | ------ | ----------------------- | ------------------ | ----------------------------- |
+| **Generate Key**   | `0x01` | slot (0–3) | `0x00` | `[PIN_LEN][PIN][FLAGS]` | 65-byte public key | Create new EC P-256 keypair   |
+| **Get Public Key** | `0x02` | slot (0–3) | `0x00` | —                       | 65 bytes           | Uncompressed EC point         |
+| **Sign**           | `0x03` | slot (0–3) | flags  | digest (1–128 bytes)    | DER signature      | Sign pre-computed digest      |
+| **List Keys**      | `0x04` | `0x00`     | `0x00` | —                       | 1-byte bitmask     | Get populated slots           |
+| **Verify PIN**     | `0x05` | `0x00`     | `0x00` | PIN bytes               | —                  | Authenticate user for session |
+| **Regenerate Key** | `0x06` | slot (0–3) | `0x00` | `[PIN_LEN][PIN][FLAGS]` | 65-byte public key | Replace existing key          |
+| **Clear Key**      | `0x07` | slot (0–3) | `0x00` | `[PIN_LEN][PIN][FLAGS]` | —                  | Delete key and flags          |
+| **Get Flags**      | `0x08` | slot (0–3) | `0x00` | —                       | 1-byte flags       | Read per-key flags            |
 
 ### Admin Block (0x7F–0x7B)
 
-| Command | INS | P1 | P2 | Data | Description |
-|---------|-----|----|----|----|-------------|
-| **Card Init** | `0x7F` | PIN length | PUK length | PIN \|\| PUK | One-time init; fails if already done |
-| **Set PIN** | `0x7E` | old PIN length | `0x00` | old PIN \|\| new PIN | Change PIN |
-| **Set PUK** | `0x7D` | old PUK length | `0x00` | old PUK \|\| new PUK | Change PUK |
-| **Unblock Card** | `0x7C` | PUK length | `0x00` | PUK \|\| new PIN | Unblock blocked PIN |
-| **Reset Card** | `0x7B` | `0x00` | `0x00` | Phase 1: none / Phase 2: 16-byte nonce | Two-phase factory reset |
+| Command          | INS    | P1             | P2         | Data                                   | Description                          |
+| ---------------- | ------ | -------------- | ---------- | -------------------------------------- | ------------------------------------ |
+| **Card Init**    | `0x7F` | PIN length     | PUK length | PIN \|\| PUK                           | One-time init; fails if already done |
+| **Set PIN**      | `0x7E` | old PIN length | `0x00`     | old PIN \|\| new PIN                   | Change PIN                           |
+| **Set PUK**      | `0x7D` | old PUK length | `0x00`     | old PUK \|\| new PUK                   | Change PUK                           |
+| **Unblock Card** | `0x7C` | PUK length     | `0x00`     | PUK \|\| new PIN                       | Unblock blocked PIN                  |
+| **Reset Card**   | `0x7B` | `0x00`         | `0x00`     | Phase 1: none / Phase 2: 16-byte nonce | Two-phase factory reset              |
 
 ## Status Codes
 
-| Code | Meaning |
-|------|---------|
-| `0x9000` | Success |
-| `0x6982` | Security status not satisfied (PIN required, card not initialized, or wrong reset nonce) |
-| `0x6983` | PIN or PUK blocked |
-| `0x6985` | Key slot already occupied (GEN_KEY) — use REGEN_KEY |
-| `0x63Cx` | Wrong PIN/PUK, `x` tries remaining |
-| `0x6A82` | Key not found in slot |
-| `0x6A86` | Incorrect P1/P2 parameters |
-| `0x6A80` | Invalid flags (reserved bits set) |
-| `0x6700` | Wrong length (invalid APDU or PIN length) |
-| `0x6F00` | Internal error |
+| Code     | Meaning                                                    |
+| -------- | ---------------------------------------------------------- |
+| `0x9000` | Success                                                    |
+| `0x6982` | Security status not satisfied                              |
+| `0x6983` | PIN or PUK blocked                                         |
+| `0x6985` | Key slot already occupied (GEN_KEY) — use REGEN_KEY        |
+| `0x63Cx` | Wrong PIN/PUK, `x` tries remaining                         |
+| `0x6A82` | Key not found in slot                                      |
+| `0x6A86` | Incorrect P1/P2 parameters                                 |
+| `0x6A80` | Invalid flags (reserved bits set)                          |
+| `0x6700` | Wrong length (invalid APDU or PIN length)                  |
+| `0x6F00` | Internal error                                             |
+| `0x6986` | Command not alowed -- used when card isn't initialized yet |
 
 ## Complete Usage Examples
 
@@ -99,6 +88,9 @@ Response: 90 00
 ### 2. Initialize Card (first use only)
 
 PIN "1234" (4 bytes), PUK "12345678" (8 bytes):
+
+> [!abstract] PIN/PUK length
+> The PIN and PUK can be each up to 255 bytes long.
 
 ```
 Command: 00 7F 04 08 0C 31 32 33 34 31 32 33 34 35 36 37 38
@@ -204,6 +196,7 @@ Bits 2-0: Reserved (must be 0)
 ```
 
 Common flag combinations:
+
 - `0x80`: Require PIN for every signature
 - `0x00`: PIN lasts until card deselect
 - `0x88`: Require PIN + erase on lock
@@ -264,6 +257,7 @@ The applet returns ECDSA signatures in DER format. To verify:
 2. **Verify** using the public key and original message with ECDSA-SHA256
 
 Example DER signature structure:
+
 ```
 30 [length]           -- SEQUENCE
    02 [r-length] [r]  -- INTEGER r
@@ -273,20 +267,24 @@ Example DER signature structure:
 ## Error Handling
 
 ### PIN Management
+
 - 3 failed PIN attempts → PIN blocked (`0x6983`)
 - Use `UNBLOCK_CARD` (`0x7C`) with PUK to unblock and set new PIN
 - 5 failed PUK attempts → PUK permanently blocked; use `RESET_CARD`
 
 ### Slot Management
+
 - **GEN_KEY Protection**: Returns `0x6985` if slot occupied
 - **Solution**: Use `REGEN_KEY` (`0x06`) to replace keys intentionally
 - **Atomic Operations**: Key generation and flag setting are transactional
 
 ### Uninitialized Card
-- All instructions except SELECT and `CARD_INIT` return `0x6982`
+
+- All instructions except SELECT and `CARD_INIT` return `0x6986`
 - Send `INS_CARD_INIT` (`0x7F`) with your PIN and PUK before any key operations
 
 ### Hardware vs Simulator
+
 - **✅ Real Hardware**: All operations work reliably with full P-256 support
 - **⚠️ Simulators**: P-256 domain parameters may fail due to environment limitations
 
@@ -300,38 +298,16 @@ Example DER signature structure:
 6. **Factory Reset**: `RESET_CARD` requires no credentials; protect physical card access
 7. **Standards Compliance**: Follows JavaCard 3.0.5 and ISO 7816-4 specifications
 
-## Migration from v1.x
-
-### Updated Command Formats
-
-**Old v1.x (all obsolete):**
-
-| Old INS | Old Byte | New INS | New Byte |
-|---------|----------|---------|----------|
-| `INS_REGEN_KEY` | `0x08` | `INS_REGEN_KEY` | `0x06` |
-| `INS_CLEAR_KEY` | `0x0A` | `INS_CLEAR_KEY` | `0x07` |
-| `INS_GET_FLAGS` | `0x11` | `INS_GET_FLAGS` | `0x08` |
-| `INS_CHANGE_PIN` | `0x06` | `INS_SET_PIN` | `0x7E` |
-| `INS_UNBLOCK_PIN` | `0x09` | `INS_UNBLOCK_CARD` | `0x7C` |
-| `INS_SET_FLAGS` | `0x07` | *(removed)* | — |
-
-### Application Updates Required
-
-1. **Add CARD_INIT on first use** (replaces default PIN assumption)
-2. **Update INS bytes** for REGEN_KEY, CLEAR_KEY, GET_FLAGS, CHANGE_PIN, UNBLOCK_PIN
-3. **Handle new error code** `0x6982` on uninitialized card
-4. **Add RESET_CARD support** for lockout recovery
-
 ## Performance Characteristics
 
 Based on real JavaCard hardware testing:
 
-| Operation | Performance | Notes |
-|-----------|------------|-------|
-| Card Init | <50ms | One-time operation |
-| Key Generation | ~125ms | Returns public key immediately |
-| Signature Generation | <100ms | DER-encoded output |
-| PIN Verification | <50ms | Session-scoped by default |
-| Public Key Retrieval | <50ms | 65-byte uncompressed format |
+| Operation            | Performance | Notes                          |
+| -------------------- | ----------- | ------------------------------ |
+| Card Init            | <50ms       | One-time operation             |
+| Key Generation       | ~125ms      | Returns public key immediately |
+| Signature Generation | <100ms      | DER-encoded output             |
+| PIN Verification     | <50ms       | Session-scoped by default      |
+| Public Key Retrieval | <50ms       | 65-byte uncompressed format    |
 
 This completes the API reference for PC/SC interaction with the EspreSSHo Mokapot applet.

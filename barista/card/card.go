@@ -7,7 +7,7 @@ import (
 
 	"github.com/ebfe/scard"
 
-	"github.com/furrytel/espressoho/barista/crypto"
+	"github.com/indrora/EspreSSHo/barista/crypto"
 )
 
 // Card wraps an scard.Card connected to the Mokapot applet.
@@ -88,7 +88,7 @@ func (card *Card) Close() {
 func (card *Card) transmit(apdu []byte) ([]byte, uint16, error) {
 	card.mu.Lock()
 	defer card.mu.Unlock()
-	
+
 	resp, err := card.handle.Transmit(apdu)
 	if err != nil {
 		return nil, 0, fmt.Errorf("transmit APDU: %w", err)
@@ -127,4 +127,19 @@ func pickReader(readers []string, readerName string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no reader matching %q — available: %v", readerName, readers)
+}
+
+// IsInitialized checks if the card has been initialized by attempting a simple operation.
+// Returns true if initialized, false if uninitialized, or an error for other failures.
+func (card *Card) IsInitialized() (bool, error) {
+	// Try to list slots - this will fail with SW_SECURITY_STATUS_NOT_SATISFIED (0x6982)
+	// on an uninitialized card, but succeed on an initialized card.
+	_, err := card.ListSlots()
+	if err != nil {
+		if err == ErrCommandNotAllowed {
+			return false, nil // Card is uninitialized
+		}
+		return false, err // Other error
+	}
+	return true, nil // Card is initialized
 }

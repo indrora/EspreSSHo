@@ -9,8 +9,8 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/furrytel/espressoho/barista/card"
-	"github.com/furrytel/espressoho/barista/crypto"
+	"github.com/indrora/EspreSSHo/barista/card"
+	"github.com/indrora/EspreSSHo/barista/crypto"
 )
 
 var keysCmd = &cobra.Command{
@@ -23,9 +23,6 @@ func init() {
 	keysCmd.AddCommand(keysGenCmd)
 	keysCmd.AddCommand(keysRegenCmd)
 	keysCmd.AddCommand(keysClearCmd)
-	keysCmd.AddCommand(keysFlagsCmd)
-	keysCmd.AddCommand(keysSignCmd)
-	keysCmd.AddCommand(keysVerifyCmd)
 
 	// Add flags for the list command
 	keysListCmd.Flags().BoolP("verbose", "v", false, "Show detailed information including flags")
@@ -37,11 +34,6 @@ func init() {
 		cmd.Flags().Uint8("timeout", 0, "PIN re-prompt timeout in minutes (0 = session-scoped)")
 		cmd.Flags().Bool("erase-on-lock", false, "Erase key if PIN becomes blocked")
 	}
-
-	// Flag options for keysFlagsCmd (deprecated).
-	keysFlagsCmd.Flags().Bool("require-pin", false, "Require PIN before each signing operation")
-	keysFlagsCmd.Flags().Uint8("timeout", 0, "PIN re-prompt timeout in minutes (0 = session-scoped)")
-	keysFlagsCmd.Flags().Bool("erase-on-lock", false, "Erase key if PIN becomes blocked")
 }
 
 // -------------------------------------------------------------------------

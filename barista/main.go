@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/furrytel/espressoho/barista/cmd"
+	"github.com/indrora/EspreSSHo/barista/cmd"
 )
 
 func main() {
