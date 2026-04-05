@@ -1,9 +1,0 @@
------BEGIN ESPRESSHO SIGNATURE-----
-Algorithm: SHA256
-File: barista
-Hash: f560d8d0fb8ae18e2b1245e4d87a614cab07fe0f7ee3f757faeb7c08d6b0bcbc
-Slot: 1
-
-MEYCIQCVHDonnq0oXx3VTTObrOCOnYHdzDzYQTSQg2LppXbgHgIhAL4fiwbSe1Pr
-01YJw33TSRNnPPisrDW1c3nHnkQ3DUr8
------END ESPRESSHO SIGNATURE-----
