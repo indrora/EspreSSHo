@@ -15,7 +15,7 @@ The core design goal is that private keys never leave the card. All signing oper
 
 ### Target Platform
 
-- JavaCard 3.0.5
+- JavaCard 3.2.0v25.1 / SDK25 (targeting JavaCard 3.0.5 compatibility)
 - ECC P-256 (`ALG_EC_FP`, 256-bit)
 - Standard JavaCard API only — no third-party dependencies
 - Applet AID: CA:FE:4D:6F:6B:61
@@ -23,16 +23,25 @@ The core design goal is that private keys never leave the card. All signing oper
 ### Key Storage
 
 Up to 4 ECC P-256 keypairs stored in EEPROM. Each slot has:
+
 - A `KeyPair` object (public + private `ECKey`)
 - A `byte` of flags (see below)
+
+### Card Lifecycle
+
+After installation the card is **uninitialized**. Only SELECT and `INS_CARD_INIT` (0x7F) are accepted. Every other instruction returns `SW_SECURITY_STATUS_NOT_SATISFIED` (0x6982) until `CARD_INIT` has been called and set `initialized = true` in EEPROM.
+
+`INS_RESET_CARD` (0x7B) is the two-phase nuclear reset that returns the card to the uninitialized state without requiring any credentials. It is the escape hatch for permanent lockout or card handoff scenarios.
 
 ### PIN
 
 Uses `javacard.framework.OwnerPIN`. A single PIN protects the card with:
+
+- No default PIN — credentials are set by `INS_CARD_INIT` at first use
 - Configurable max tries (default 3) after which the PIN is blocked
 - `isValidated()` resets on card deselect/power off — each session requires fresh PIN entry
 - A PUK (`OwnerPIN`) for unblocking, using `resetAndUnblock()`
-- PIN change requires presenting the old PIN first
+- PIN change via `INS_SET_PIN` (0x7E) requires presenting the old PIN first
 
 ### Per-Key Flags (1 byte per slot)
 
@@ -44,14 +53,15 @@ Uses `javacard.framework.OwnerPIN`. A single PIN protects the card with:
 └───────┴──────────┴─────────┴──────┘
 ```
 
-| Bits | Name | Description |
-|---|---|---|
-| 7 | `FLAG_REQUIRE_PIN` | Require PIN validation before signing with this key |
-| 6–4 | `FLAG_TIMEOUT` | PIN timeout in minutes (0 = session-scoped only, 1–7 = literal minutes) |
-| 3 | `FLAG_ERASE_ON_LOCK` | Erase this key's material when the PIN becomes blocked |
-| 2–0 | Reserved | |
+| Bits | Name                 | Description                                                             |
+| ---- | -------------------- | ----------------------------------------------------------------------- |
+| 7    | `FLAG_REQUIRE_PIN`   | Require PIN validation before signing with this key                     |
+| 6–4  | `FLAG_TIMEOUT`       | PIN timeout in minutes (0 = session-scoped only, 1–7 = literal minutes) |
+| 3    | `FLAG_ERASE_ON_LOCK` | Erase this key's material when the PIN becomes blocked                  |
+| 2–0  | Reserved             |                                                                         |
 
 Constants:
+
 ```java
 static final byte FLAG_REQUIRE_PIN   = (byte)0x80;
 static final byte FLAG_TIMEOUT_MASK  = (byte)0x70;
@@ -61,20 +71,30 @@ static final byte FLAG_ERASE_ON_LOCK = (byte)0x08;
 
 ### APDU Instruction Set
 
+#### Normal operations (0x01–0x08) — require initialized card
+
 All write operations use unified PIN-protected format for security and consistency.
 
-| INS | Byte | P1 | P2 | Data | Description |
-|---|---|---|---|---|---|
-| `INS_GEN_KEY` | `0x01` | slot (0–3) | — | [PIN_LEN][PIN][FLAGS] | Generate new keypair in slot (requires PIN, fails if occupied) |
-| `INS_GET_PUBKEY` | `0x02` | slot (0–3) | — | — | Return raw EC public key |
-| `INS_SIGN` | `0x03` | slot (0–3) | flags | SHA-256 digest (32 bytes) | Sign digest, return DER signature |
-| `INS_LIST_KEYS` | `0x04` | — | — | — | Return populated slot bitmap |
-| `INS_VERIFY_PIN` | `0x05` | — | — | PIN bytes | Verify PIN |
-| `INS_CHANGE_PIN` | `0x06` | old PIN length | — | old PIN \|\| new PIN | Change PIN |
-| `INS_SET_FLAGS` | `0x07` | slot (0–3) | flags byte | — | Set per-key flags |
-| `INS_REGEN_KEY` | `0x08` | slot (0–3) | — | [PIN_LEN][PIN][FLAGS] | Regenerate keypair in slot (requires PIN) |
-| `INS_UNBLOCK_PIN` | `0x09` | PUK length | — | PUK \|\| new PIN | Unblock PIN using PUK |
-| `INS_CLEAR_KEY` | `0x0A` | slot (0–3) | — | [PIN_LEN][PIN][FLAGS] | Clear key and flags in slot (requires PIN) |
+| INS              | Byte   | P1         | P2    | Data                  | Description                                                    |
+| ---------------- | ------ | ---------- | ----- | --------------------- | -------------------------------------------------------------- |
+| `INS_GEN_KEY`    | `0x01` | slot (0–3) | —     | [PIN_LEN][PIN][FLAGS] | Generate new keypair in slot (requires PIN, fails if occupied) |
+| `INS_GET_PUBKEY` | `0x02` | slot (0–3) | —     | —                     | Return raw EC public key (no PIN required)                     |
+| `INS_SIGN`       | `0x03` | slot (0–3) | flags | digest (1–128 bytes)  | Sign pre-computed digest, return DER signature                 |
+| `INS_LIST_KEYS`  | `0x04` | —          | —     | —                     | Return populated slot bitmap (no PIN required)                 |
+| `INS_VERIFY_PIN` | `0x05` | —          | —     | PIN bytes             | Verify PIN for this session                                    |
+| `INS_REGEN_KEY`  | `0x06` | slot (0–3) | —     | [PIN_LEN][PIN][FLAGS] | Regenerate keypair in slot (requires PIN, replaces any key)    |
+| `INS_CLEAR_KEY`  | `0x07` | slot (0–3) | —     | [PIN_LEN][PIN][FLAGS] | Clear key and flags in slot (requires PIN)                     |
+| `INS_GET_FLAGS`  | `0x08` | slot (0–3) | —     | —                     | Return flags byte for slot (no PIN required)                   |
+
+#### Admin block (0x7F–0x7B) — card lifecycle management
+
+| INS                | Byte   | P1         | P2         | Data                        | Description                                                                   |
+| ------------------ | ------ | ---------- | ---------- | --------------------------- | ----------------------------------------------------------------------------- |
+| `INS_CARD_INIT`    | `0x7F` | PIN length | PUK length | PIN \|\| PUK                | One-time init — sets PIN+PUK, marks card initialized. Fails if already done.  |
+| `INS_SET_PIN`      | `0x7E` | old length | —          | old PIN \|\| new PIN        | Change PIN (requires current PIN)                                             |
+| `INS_SET_PUK`      | `0x7D` | old length | —          | old PUK \|\| new PUK        | Change PUK (requires current PUK)                                             |
+| `INS_UNBLOCK_CARD` | `0x7C` | PUK length | —          | PUK \|\| new PIN            | Unblock blocked PIN using PUK                                                 |
+| `INS_RESET_CARD`   | `0x7B` | —          | —          | Phase1: none / Phase2: 16 B | Two-phase factory reset — no credentials required (see below)                 |
 
 ### SIGN Instruction Detail
 
@@ -85,14 +105,14 @@ All write operations use unified PIN-protected format for security and consisten
 
 ### Status Words
 
-| SW | Meaning |
-|---|---|
-| `0x9000` | Success |
-| `0x6982` | Security status not satisfied (PIN verification failed) |
-| `0x6983` | PIN blocked |
-| `0x6985` | Key slot already occupied (use REGEN_KEY to replace) |
-| `0x6A82` | Key slot not found (empty slot) |
-| `0x63Cx` | Wrong PIN, `x` tries remaining |
+| SW       | Meaning                                                                                     |
+| -------- | ------------------------------------------------------------------------------------------- |
+| `0x9000` | Success                                                                                     |
+| `0x6982` | Security status not satisfied — PIN failed, card not yet initialized, or wrong reset nonce  |
+| `0x6983` | PIN or PUK blocked                                                                          |
+| `0x6985` | Key slot already occupied (use `INS_REGEN_KEY`)                                             |
+| `0x6A82` | Key slot not found (empty slot)                                                             |
+| `0x63Cx` | Wrong PIN/PUK, `x` tries remaining                                                          |
 
 ### Unified PIN-Protected Operations
 
@@ -107,30 +127,66 @@ APDU Format: [PIN_LEN][PIN][FLAGS]
 - **FLAGS**: Security flags byte (see Flag Constants)
 
 **Examples:**
+
 ```
-GEN_KEY with PIN "1234" and FLAG_REQUIRE_PIN:
+GEN_KEY (0x01) with PIN "1234" and FLAG_REQUIRE_PIN:
 00 01 00 00 06 04 31 32 33 34 80
 
-CLEAR_KEY with PIN "test" and no flags:
-00 0A 01 00 05 04 74 65 73 74 00
+CLEAR_KEY (0x07) with PIN "test" and no flags:
+00 07 01 00 06 04 74 65 73 74 00
 ```
+
+### INS_RESET_CARD Two-Phase Protocol
+
+`INS_RESET_CARD` (0x7B) is a "blow everything away" reset requiring no credentials:
+
+**Phase 1** — no data (`Lc` absent):
+```
+00 7B 00 00        → 16-byte nonce (stored in CLEAR_ON_DESELECT transient memory)
+```
+
+**Phase 2** — data = the 16 bytes returned by Phase 1:
+```
+00 7B 00 00 10 <16 nonce bytes>    → 90 00 (card wiped, initialized = false)
+```
+
+- Deselecting between phases clears the nonce — restart from Phase 1
+- Wrong nonce in Phase 2 immediately invalidates the nonce and returns 0x6982
+- After success, `INS_CARD_INIT` must be called before any other instruction
 
 ### Security Model
 
+**Uninitialized card (before INS_CARD_INIT):**
+
+- Only SELECT and `INS_CARD_INIT` (0x7F) are accepted
+- All other instructions return `SW_SECURITY_STATUS_NOT_SATISFIED` (0x6982)
+
 **Read Operations (No PIN Required):**
+
 - GET_PUBKEY: Returns public key for any populated slot
 - LIST_KEYS: Returns bitmap of occupied slots
+- GET_FLAGS: Returns flags byte for a slot
 
 **Write Operations (PIN Required):**
+
 - GEN_KEY: Creates new key, fails if slot occupied
 - REGEN_KEY: Replaces existing key, explicitly sets flags
 - CLEAR_KEY: Securely deletes key and clears flags
 
+**Admin Operations:**
+
+- SET_PIN (0x7E): Requires current PIN
+- SET_PUK (0x7D): Requires current PUK
+- UNBLOCK_CARD (0x7C): Requires PUK
+- RESET_CARD (0x7B): Two-phase nonce only — no credentials
+
 **Protection Features:**
+
 - **Slot Protection**: GEN_KEY prevents accidental overwrites
 - **Explicit Flags**: All operations set flags from APDU data
 - **Transaction Safety**: All operations are atomic
 - **PIN Enforcement**: All write operations require PIN verification
+- **Initialization Gate**: Uninitialized cards reject everything except CARD_INIT
 
 ### ERASE_ON_LOCK Behavior
 
@@ -141,14 +197,16 @@ When the PIN becomes blocked (final failed attempt consumed), any slot with `FLA
 ### Dependencies
 
 **Go Dependencies (from go.mod):**
+
 ```
-github.com/ebfe/scard          // PC/SC smart card bindings  
+github.com/ebfe/scard          // PC/SC smart card bindings
 github.com/spf13/cobra         // CLI framework
 golang.org/x/crypto/ssh/agent  // SSH agent interface and ServeAgent
 golang.org/x/term              // ReadPassword for PIN prompt
 ```
 
 **JavaCard Test Dependencies (from ivy.xml):**
+
 ```
 com.github.martinpaljak/jcardengine  // JavaCard applet testing framework
 junit/junit                          // Unit testing framework
@@ -184,6 +242,7 @@ type CardAgent struct {
 PIN entry is internal to the agent — the SSH agent protocol has no PIN concept. PIN prompting uses `SSH_ASKPASS` if set (for GUI environments), falling back to `term.ReadPassword` on the terminal. PIN bytes are zeroed after use with a defer.
 
 `needsPIN(slot int)` logic:
+
 1. If `FLAG_REQUIRE_PIN` not set → false
 2. If not yet verified this session → true
 3. If timeout bits == 0 → false (session-scoped, already verified)
@@ -230,10 +289,11 @@ On receiving `ErrPINBlocked`, the agent calls `refreshSlots()` to invalidate any
 func main() {
     // 1. Connect to card via PC/SC
     // 2. Select applet by AID
-    // 3. Enumerate populated slots, cache public keys
-    // 4. Listen on Unix socket (e.g. /tmp/barista.sock)
-    // 5. Set SSH_AUTH_SOCK
-    // 6. Loop: accept conn, go agent.ServeAgent(cardAgent, conn)
+    // 3. Check if card is initialized (try LIST_KEYS; if 0x6982 → prompt CARD_INIT)
+    // 4. Enumerate populated slots, cache public keys
+    // 5. Listen on Unix socket (e.g. /tmp/barista.sock)
+    // 6. Set SSH_AUTH_SOCK
+    // 7. Loop: accept conn, go agent.ServeAgent(cardAgent, conn)
 }
 ```
 
@@ -255,9 +315,9 @@ Git sends the raw commit buffer; the SSH signing protocol handles hashing. Since
 
 ## Build Environment
 
-- **Mokapot:** JavaCard 3.0.5, Java 21+, Apache Ant with ant-javacard plugin
+- **Mokapot:** JavaCard 3.2.0v25.1 / SDK25, Java 21+, Apache Ant with ant-javacard plugin
 - **Barista:** Go 1.23+, uses cobra CLI framework and scard for PC/SC
-- **Card loading:** GlobalPlatformPro (`gp` tool)  
+- **Card loading:** GlobalPlatformPro (`gp` tool)
 - **Build system:** just command runner
 - **Platform:** Cross-platform (developed on arm64 macOS)
 

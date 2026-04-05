@@ -5,43 +5,30 @@ This document provides complete instructions for interacting with the EspreSSHo 
 ## Quick Start
 
 1. **Select the applet** using AID: `CAFE4D6F6B61000100000000000000`
-2. **Generate or list keys** using the current PIN-protected format
-3. **Sign data** with a key
-4. **Verify signature** on host
+2. **Initialize the card** with `INS_CARD_INIT` (first use only)
+3. **Generate or list keys** using the PIN-protected format
+4. **Sign data** with a key
+5. **Verify signature** on the host
 
 ## Applet Identification
 
 - **Package AID**: `CAFE4D6F6B61` ("CafeMoka")
 - **Applet AID**: `CAFE4D6F6B61000100000000000000`
-- **Default PIN**: `1234` (4 bytes: `0x31 0x32 0x33 0x34`)
-- **Default PUK**: `12345678` (8 bytes: `0x31 0x32 0x33 0x34 0x35 0x36 0x37 0x38`)
+- **Default PIN**: none — set by `INS_CARD_INIT` at first use
+- **Default PUK**: none — set by `INS_CARD_INIT` at first use
 
-## APDU Breaking Changes
+## APDU Breaking Changes from v1.x
 
-**⚠️ BREAKING CHANGES:**
-- All write operations now require PIN verification
-- GEN_KEY and REGEN_KEY use unified APDU format: `[PIN_LEN][PIN][FLAGS]`
-- GEN_KEY now fails if slot is occupied (use REGEN_KEY to replace)
-- Both GEN_KEY and REGEN_KEY return the generated public key as convenience
-
-## Basic PC/SC Session
-
-```python
-# Example in Python with pyscard
-from smartcard.System import readers
-from smartcard.util import toHexString, toBytes
-
-# Connect to card
-reader = readers()[0]
-connection = reader.createConnection()
-connection.connect()
-
-# Select applet
-SELECT = [0x00, 0xA4, 0x04, 0x00, 0x10] + \
-         [0xCA, 0xFE, 0x4D, 0x6F, 0x6B, 0x61, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-response, sw1, sw2 = connection.transmit(SELECT)
-assert (sw1, sw2) == (0x90, 0x00), f"Select failed: {sw1:02X}{sw2:02X}"
-```
+**⚠️ BREAKING CHANGES (v2.0):**
+- No default PIN/PUK — `INS_CARD_INIT` must be called before anything else
+- `INS_CHANGE_PIN (0x06)` → `INS_SET_PIN (0x7E)`
+- `INS_UNBLOCK_PIN (0x09)` → `INS_UNBLOCK_CARD (0x7C)`
+- `INS_SET_FLAGS (0x07)` removed
+- `INS_REGEN_KEY` renumbered: 0x08 → 0x06
+- `INS_CLEAR_KEY` renumbered: 0x0A → 0x07
+- `INS_GET_FLAGS` renumbered: 0x11 → 0x08
+- New: `INS_SET_PUK (0x7D)`, `INS_RESET_CARD (0x7B)`
+- New: Initialization gate — uninitialized cards reject all instructions except SELECT and CARD_INIT
 
 ## APDU Command Format
 
@@ -52,7 +39,7 @@ CLA INS P1  P2  [Lc Data] [Le]
 ```
 
 - **CLA**: Always `0x00`
-- **INS**: Instruction byte (see table below)
+- **INS**: Instruction byte (see tables below)
 - **P1, P2**: Parameters
 - **Lc**: Length of data (if present)
 - **Data**: Command data
@@ -60,39 +47,40 @@ CLA INS P1  P2  [Lc Data] [Le]
 
 ## Command Reference
 
-### Core Commands
+### Normal Operations (0x01–0x08)
+
+All require the card to have been initialized via `INS_CARD_INIT`.
 
 | Command | INS | P1 | P2 | Data Format | Response | Description |
 |---------|-----|----|----|-------------|----------|-------------|
-| **List Keys** | `0x04` | `0x00` | `0x00` | — | 1 byte bitmask | Get populated slots |
-| **Generate Key** | `0x01` | slot (0–3) | `0x00` | `[PIN_LEN][PIN][FLAGS]` | 65 bytes public key | Create new EC P-256 keypair |
+| **Generate Key** | `0x01` | slot (0–3) | `0x00` | `[PIN_LEN][PIN][FLAGS]` | 65-byte public key | Create new EC P-256 keypair |
 | **Get Public Key** | `0x02` | slot (0–3) | `0x00` | — | 65 bytes | Uncompressed EC point |
-| **Sign** | `0x03` | slot (0–3) | flags | 32 bytes (SHA-256) | DER signature | Sign digest |
+| **Sign** | `0x03` | slot (0–3) | flags | digest (1–128 bytes) | DER signature | Sign pre-computed digest |
+| **List Keys** | `0x04` | `0x00` | `0x00` | — | 1-byte bitmask | Get populated slots |
+| **Verify PIN** | `0x05` | `0x00` | `0x00` | PIN bytes | — | Authenticate user for session |
+| **Regenerate Key** | `0x06` | slot (0–3) | `0x00` | `[PIN_LEN][PIN][FLAGS]` | 65-byte public key | Replace existing key |
+| **Clear Key** | `0x07` | slot (0–3) | `0x00` | `[PIN_LEN][PIN][FLAGS]` | — | Delete key and flags |
+| **Get Flags** | `0x08` | slot (0–3) | `0x00` | — | 1-byte flags | Read per-key flags |
 
-### Authentication Commands
+### Admin Block (0x7F–0x7B)
 
 | Command | INS | P1 | P2 | Data | Description |
 |---------|-----|----|----|----|-------------|
-| **Verify PIN** | `0x05` | `0x00` | `0x00` | PIN bytes | Authenticate user |
-| **Change PIN** | `0x06` | old PIN length | `0x00` | old PIN + new PIN | Update PIN |
-| **Unblock PIN** | `0x09` | PUK length | `0x00` | PUK + new PIN | Unblock with PUK |
-
-### Management Commands
-
-| Command | INS | P1 | P2 | Data Format | Response | Description |
-|---------|-----|----|----|-------------|----------|-------------|
-| **Regenerate Key** | `0x08` | slot (0–3) | `0x00` | `[PIN_LEN][PIN][FLAGS]` | 65 bytes public key | Replace existing key |
-| **Clear Key** | `0x0A` | slot (0–3) | `0x00` | `[PIN_LEN][PIN][FLAGS]` | — | Delete key and flags |
+| **Card Init** | `0x7F` | PIN length | PUK length | PIN \|\| PUK | One-time init; fails if already done |
+| **Set PIN** | `0x7E` | old PIN length | `0x00` | old PIN \|\| new PIN | Change PIN |
+| **Set PUK** | `0x7D` | old PUK length | `0x00` | old PUK \|\| new PUK | Change PUK |
+| **Unblock Card** | `0x7C` | PUK length | `0x00` | PUK \|\| new PIN | Unblock blocked PIN |
+| **Reset Card** | `0x7B` | `0x00` | `0x00` | Phase 1: none / Phase 2: 16-byte nonce | Two-phase factory reset |
 
 ## Status Codes
 
 | Code | Meaning |
 |------|---------|
 | `0x9000` | Success |
-| `0x6982` | Security status not satisfied (PIN verification failed) |
-| `0x6983` | PIN blocked (use PUK) |
-| `0x6985` | Key slot already occupied (GEN_KEY), use REGEN_KEY |
-| `0x63Cx` | Wrong PIN, `x` tries remaining |
+| `0x6982` | Security status not satisfied (PIN required, card not initialized, or wrong reset nonce) |
+| `0x6983` | PIN or PUK blocked |
+| `0x6985` | Key slot already occupied (GEN_KEY) — use REGEN_KEY |
+| `0x63Cx` | Wrong PIN/PUK, `x` tries remaining |
 | `0x6A82` | Key not found in slot |
 | `0x6A86` | Incorrect P1/P2 parameters |
 | `0x6A80` | Invalid flags (reserved bits set) |
@@ -108,73 +96,91 @@ Command: 00 A4 04 00 10 CA FE 4D 6F 6B 61 00 01 00 00 00 00 00 00 00 00
 Response: 90 00
 ```
 
-### 2. List Available Keys
+### 2. Initialize Card (first use only)
+
+PIN "1234" (4 bytes), PUK "12345678" (8 bytes):
+
+```
+Command: 00 7F 04 08 0C 31 32 33 34 31 32 33 34 35 36 37 38
+         │  │  │  │  │
+         │  │  │  │  └── Lc = 4 + 8 = 12
+         │  │  │  └───── P2 = PUK length (8)
+         │  │  └──────── P1 = PIN length (4)
+         │  └─────────── INS (CARD_INIT)
+         └────────────── CLA
+
+Response: 90 00
+```
+
+### 3. List Available Keys
 
 ```
 Command: 00 04 00 00
-Response: 00 90 00  (no keys present - bitmask = 0x00)
+Response: 00 90 00  (no keys present)
 ```
 
-### 3. Generate Key in Slot 0 (Current format)
+### 4. Generate Key in Slot 0
 
 ```
 Command: 00 01 00 00 06 04 31 32 33 34 80
-         │  │  │  │  │  │  └─ PIN bytes (1234)
+         │  │  │  │  │  │  └─ PIN bytes (1234) ─┘ └─ FLAGS (0x80)
          │  │  │  │  │  └─── PIN length (4)
          │  │  │  │  └────── Data length (6)
          │  │  │  └───────── P2 (reserved)
          │  │  └──────────── P1 (slot 0)
          │  └─────────────── INS (GEN_KEY)
          └────────────────── CLA
-         
-Data: 04 31 32 33 34 80
-      │  └─ PIN (1234) ─┘ └─ FLAGS (0x80 = FLAG_REQUIRE_PIN)
-      └─ PIN_LEN (4)
 
-Response: 04[64 bytes public key]90 00  (65-byte uncompressed public key + success)
+Response: 04[64 bytes public key]90 00
 ```
 
-### 4. List Keys Again
+### 5. Sign a SHA-256 Hash
 
-```
-Command: 00 04 00 00
-Response: 01 90 00  (bit 0 set = slot 0 has key)
-```
-
-### 5. Get Public Key from Slot 0
-
-```
-Command: 00 02 00 00
-Response: 04 [32 bytes X] [32 bytes Y] 90 00
-```
-
-The public key is returned as 65 bytes:
-- Byte 0: `0x04` (uncompressed point indicator)
-- Bytes 1-32: X coordinate
-- Bytes 33-64: Y coordinate
-
-### 6. Sign a SHA-256 Hash
-
-First compute SHA-256 of your data on the host, then:
+Pre-compute SHA-256 of your data on the host, then:
 
 ```
 Command: 00 03 00 00 20 [32 bytes SHA-256 hash]
 Response: [DER-encoded ECDSA signature] 90 00
 ```
 
-### 7. Regenerate Key in Existing Slot
+### 6. Regenerate Key in Existing Slot
 
 ```
-Command: 00 08 01 00 06 04 31 32 33 34 00
+Command: 00 06 01 00 06 04 31 32 33 34 00
                                      └─ FLAGS (0x00 = no special flags)
 Response: 04[64 bytes new public key]90 00
 ```
 
-### 8. Clear Key from Slot
+### 7. Clear Key from Slot
 
 ```
-Command: 00 0A 02 00 06 04 31 32 33 34 00
+Command: 00 07 02 00 06 04 31 32 33 34 00
 Response: 90 00  (slot 2 now empty)
+```
+
+### 8. Change PIN
+
+From "1234" to "5678":
+
+```
+Command: 00 7E 04 00 08 31 32 33 34 35 36 37 38
+Response: 90 00
+```
+
+### 9. Factory Reset (locked out)
+
+```
+# Phase 1 — request nonce
+Command: 00 7B 00 00 00
+Response: [16 nonce bytes] 90 00
+
+# Phase 2 — confirm reset with nonce
+Command: 00 7B 00 00 10 [same 16 nonce bytes]
+Response: 90 00
+
+# Re-initialize after reset
+Command: 00 7F 04 08 0C 31 32 33 34 31 32 33 34 35 36 37 38
+Response: 90 00
 ```
 
 ## Key Flags
@@ -187,8 +193,8 @@ Bit 7: FLAG_REQUIRE_PIN (0x80)
   - Clear: PIN verification lasts for session
 
 Bits 6-4: Timeout in minutes (0-7)
-  - 0: Session-scoped (until card reset)
-  - 1-7: Timeout in minutes
+  - 0: Session-scoped (until card deselect/power-off)
+  - 1-7: Timeout in minutes (host-enforced)
 
 Bit 3: FLAG_ERASE_ON_LOCK (0x08)
   - Set: Erase key if PIN becomes blocked
@@ -199,9 +205,56 @@ Bits 2-0: Reserved (must be 0)
 
 Common flag combinations:
 - `0x80`: Require PIN for every signature
-- `0x00`: PIN lasts until card reset
+- `0x00`: PIN lasts until card deselect
 - `0x88`: Require PIN + erase on lock
 - `0x10`: 1-minute timeout
+
+## Python Example
+
+```python
+from smartcard.System import readers
+from smartcard.util import toHexString
+import hashlib
+
+# Connect
+reader = readers()[0]
+conn = reader.createConnection()
+conn.connect()
+
+# Select applet
+select_cmd = [0x00, 0xA4, 0x04, 0x00, 0x10,
+              0xCA, 0xFE, 0x4D, 0x6F, 0x6B, 0x61,
+              0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+resp, sw1, sw2 = conn.transmit(select_cmd)
+assert (sw1, sw2) == (0x90, 0x00), f"Select failed: {sw1:02X}{sw2:02X}"
+
+# Initialize card (first use only)
+pin = b"1234"
+puk = b"12345678"
+init_cmd = ([0x00, 0x7F, len(pin), len(puk), len(pin) + len(puk)]
+            + list(pin) + list(puk))
+resp, sw1, sw2 = conn.transmit(init_cmd)
+if (sw1, sw2) == (0x69, 0x82):
+    print("Card already initialized")
+else:
+    assert (sw1, sw2) == (0x90, 0x00), f"Init failed: {sw1:02X}{sw2:02X}"
+
+# Generate key in slot 0 (PIN + flags required)
+flags = 0x80  # FLAG_REQUIRE_PIN
+gen_cmd = ([0x00, 0x01, 0x00, 0x00, len(pin) + 2]
+           + [len(pin)] + list(pin) + [flags])
+pubkey_resp, sw1, sw2 = conn.transmit(gen_cmd)
+assert (sw1, sw2) == (0x90, 0x00)
+print(f"Generated Public Key: {toHexString(pubkey_resp)}")
+
+# Sign something
+message = b"Hello, EspreSSHo!"
+hash_digest = hashlib.sha256(message).digest()
+sign_cmd = [0x00, 0x03, 0x00, 0x00, 0x20] + list(hash_digest)
+sig_resp, sw1, sw2 = conn.transmit(sign_cmd)
+assert (sw1, sw2) == (0x90, 0x00)
+print(f"Signature: {toHexString(sig_resp)}")
+```
 
 ## Signature Verification
 
@@ -213,7 +266,7 @@ The applet returns ECDSA signatures in DER format. To verify:
 Example DER signature structure:
 ```
 30 [length]           -- SEQUENCE
-   02 [r-length] [r]  -- INTEGER r  
+   02 [r-length] [r]  -- INTEGER r
    02 [s-length] [s]  -- INTEGER s
 ```
 
@@ -221,94 +274,53 @@ Example DER signature structure:
 
 ### PIN Management
 - 3 failed PIN attempts → PIN blocked (`0x6983`)
-- Use PUK to unblock and set new PIN
-- 5 failed PUK attempts → card permanently locked
+- Use `UNBLOCK_CARD` (`0x7C`) with PUK to unblock and set new PIN
+- 5 failed PUK attempts → PUK permanently blocked; use `RESET_CARD`
 
 ### Slot Management
 - **GEN_KEY Protection**: Returns `0x6985` if slot occupied
-- **Solution**: Use `REGEN_KEY` to intentionally replace keys
+- **Solution**: Use `REGEN_KEY` (`0x06`) to replace keys intentionally
 - **Atomic Operations**: Key generation and flag setting are transactional
-- **Validation**: Failed operations return proper error codes
 
-### Hardware vs Simulator Behavior
+### Uninitialized Card
+- All instructions except SELECT and `CARD_INIT` return `0x6982`
+- Send `INS_CARD_INIT` (`0x7F`) with your PIN and PUK before any key operations
+
+### Hardware vs Simulator
 - **✅ Real Hardware**: All operations work reliably with full P-256 support
 - **⚠️ Simulators**: P-256 domain parameters may fail due to environment limitations
-- **Development Ready**: Tested and validated on real JavaCard hardware
 
 ## Security Notes
 
-1. **PIN Protection**: All write operations require PIN verification
-2. **Hash on Host**: Send only SHA-256 digests to the card, never raw data
-3. **Key Isolation**: Each slot operates independently
-4. **PUK Backup**: Store PUK securely - it's the only PIN recovery method
-5. **Timeout Settings**: Configure appropriate timeouts for your use case
-6. **Standards Compliance**: Follows JavaCard 3.0.5 and ISO 7816-4 specifications
-7. **P-256 Compatibility**: Uses industry-standard secp256r1 domain parameters
+1. **No Default Credentials**: PIN and PUK must be set explicitly via `CARD_INIT`
+2. **PIN Protection**: All write operations require PIN verification
+3. **Hash on Host**: Send only pre-computed digests to the card, never raw data
+4. **Key Isolation**: Each slot operates independently
+5. **PUK Backup**: Store PUK securely — it is the PIN recovery method; if PUK is lost, `RESET_CARD` is the only option
+6. **Factory Reset**: `RESET_CARD` requires no credentials; protect physical card access
+7. **Standards Compliance**: Follows JavaCard 3.0.5 and ISO 7816-4 specifications
 
-## Migration from Previous Version
+## Migration from v1.x
 
 ### Updated Command Formats
 
-**Old v1.x GEN_KEY:**
-```
-00 01 00 00  (no PIN required, no flags)
-```
+**Old v1.x (all obsolete):**
 
-**Current GEN_KEY:**
-```
-00 01 00 00 06 04 31 32 33 34 80  (PIN + flags required)
-```
+| Old INS | Old Byte | New INS | New Byte |
+|---------|----------|---------|----------|
+| `INS_REGEN_KEY` | `0x08` | `INS_REGEN_KEY` | `0x06` |
+| `INS_CLEAR_KEY` | `0x0A` | `INS_CLEAR_KEY` | `0x07` |
+| `INS_GET_FLAGS` | `0x11` | `INS_GET_FLAGS` | `0x08` |
+| `INS_CHANGE_PIN` | `0x06` | `INS_SET_PIN` | `0x7E` |
+| `INS_UNBLOCK_PIN` | `0x09` | `INS_UNBLOCK_CARD` | `0x7C` |
+| `INS_SET_FLAGS` | `0x07` | *(removed)* | — |
 
 ### Application Updates Required
 
-1. **Add PIN to write operations**:
-   ```python
-   # Old
-   gen_key_cmd = [0x00, 0x01, slot, 0x00]
-   
-   # New
-   pin = b"1234"
-   flags = 0x80  # FLAG_REQUIRE_PIN
-   gen_key_cmd = [0x00, 0x01, slot, 0x00, len(pin) + 2] + [len(pin)] + list(pin) + [flags]
-   ```
-
-2. **Handle new error codes**:
-   - Check for `0x6985` (slot occupied) from GEN_KEY
-   - Use REGEN_KEY for key replacement
-   - Handle enhanced PIN verification requirements
-
-3. **Utilize public key return**:
-   ```python
-   # Key generation now returns public key immediately
-   response, sw1, sw2 = connection.transmit(gen_key_cmd)
-   if (sw1, sw2) == (0x90, 0x00):
-       public_key = response  # 65 bytes: 04 + X + Y
-   ```
-
-## Sample Session Script
-
-```bash
-#!/bin/bash
-# Using opensc-tool for testing
-
-# Select applet
-opensc-tool -s 00:A4:04:00:10:CA:FE:4D:6F:6B:61:00:01:00:00:00:00:00:00:00:00
-
-# List keys (should be empty)
-opensc-tool -s 00:04:00:00
-
-# Generate key in slot 0 with PIN 1234 and default flags
-opensc-tool -s 00:01:00:00:06:04:31:32:33:34:80
-
-# List keys (should show bit 0 set)
-opensc-tool -s 00:04:00:00
-
-# Get public key explicitly
-opensc-tool -s 00:02:00:00
-
-# Sign test hash (32 bytes of 0xAA)
-opensc-tool -s 00:03:00:00:20:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA
-```
+1. **Add CARD_INIT on first use** (replaces default PIN assumption)
+2. **Update INS bytes** for REGEN_KEY, CLEAR_KEY, GET_FLAGS, CHANGE_PIN, UNBLOCK_PIN
+3. **Handle new error code** `0x6982` on uninitialized card
+4. **Add RESET_CARD support** for lockout recovery
 
 ## Performance Characteristics
 
@@ -316,6 +328,7 @@ Based on real JavaCard hardware testing:
 
 | Operation | Performance | Notes |
 |-----------|------------|-------|
+| Card Init | <50ms | One-time operation |
 | Key Generation | ~125ms | Returns public key immediately |
 | Signature Generation | <100ms | DER-encoded output |
 | PIN Verification | <50ms | Session-scoped by default |

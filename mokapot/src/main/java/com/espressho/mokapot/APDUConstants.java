@@ -5,150 +5,195 @@ package com.espressho.mokapot;
  * Mokapot SSH-key applet.
  *
  * Keep every magic number here so the rest of the applet stays readable.
+ *
+ * ## Instruction layout
+ *
+ * ### Low side (0x01–0x08): normal card operations
+ *
+ * These instructions are gated behind card initialization and require PIN
+ * verification where noted.  The unified PIN-protected format used by write
+ * operations is:
+ *
+ * ```
+ * CLA INS P1   P2  Lc  Data
+ * 00  XX  slot 00  N   [PIN_LEN][PIN][FLAGS]
+ * ```
+ *
+ * - PIN_LEN : 1 byte (valid range 1–8)
+ * - PIN     : variable-length PIN (1–8 bytes)
+ * - FLAGS   : security flags byte (see FLAG_* constants)
+ * - Minimum data field : PIN_LEN + PIN(1) + FLAGS = 3 bytes
+ * - Maximum data field : PIN_LEN + PIN(8) + FLAGS = 10 bytes
+ *
+ * ### Admin block (0x7F–0x7B, counting downward): card lifecycle management
+ *
+ * These instructions occupy the top of the sub-128 INS space, counting down
+ * from 0x7F.  This makes them easy to spot in traces and keeps them clearly
+ * separated from normal operations.
+ *
+ * 0x70 is the hard floor: ISO 7816-4 MANAGE CHANNEL, intercepted by the JCRE
+ * before process() is called.  Reaching 0x70 would mean we have added more
+ * than 15 admin instructions — a signal to rethink the design.
+ *
+ * INS_CARD_INIT (0x7F) is the *only* instruction permitted on an
+ * uninitialized card (besides SELECT).  All others require the card to have
+ * been initialized first.
  */
 public final class APDUConstants {
 
     private APDUConstants() {}
 
-    // -------------------------------------------------------------------------
-    // Instruction bytes (INS field of the APDU header)
-    // -------------------------------------------------------------------------
-
-    // === PIN-PROTECTED WRITE OPERATIONS ===
-    // The following operations use a unified APDU format for consistency:
-    // INS_GEN_KEY (0x01), INS_REGEN_KEY (0x08), INS_CLEAR_KEY (0x0A)
-    //
-    // APDU Format:
-    // CLA INS P1  P2  Lc  Data
-    // 00  XX  slot 00  N   [PIN_LEN][PIN][FLAGS]
-    //
-    // Where:
-    // - CLA: 0x00 (standard ISO command class)
-    // - INS: Operation instruction (0x01, 0x08, or 0x0A)
-    // - P1: Key slot number (0-3)
-    // - P2: Reserved, must be 0x00
-    // - Lc: Length of data field (PIN_LEN + PIN length + 1 for FLAGS)
-    // - PIN_LEN: PIN length (1 byte, valid range 1-8)
-    // - PIN: Variable-length PIN data (1-8 bytes)
-    // - FLAGS: Security flags byte (see FLAG_* constants below)
-    //
-    // Size Constraints:
-    // - Minimum APDU: CLA+INS+P1+P2+Lc+PIN_LEN+PIN(1)+FLAGS = 8 bytes
-    // - Maximum APDU: CLA+INS+P1+P2+Lc+PIN_LEN+PIN(8)+FLAGS = 15 bytes
-    // - PIN length range: 1-8 bytes (enforced by PIN_LEN validation)
-    //
-    // Example APDU for GEN_KEY with 4-byte PIN "1234" and flags 0x80:
-    // 00 01 00 00 06 04 31 32 33 34 80
-    //    ^^ ^^ ^^ ^^ ^^ ^^  PIN data  ^^
-    //    |  |  |  |  |  |             FLAGS
-    //    |  |  |  |  |  PIN_LEN (4)
-    //    |  |  |  |  Lc = 4 + 1 + 1 = 6
-    //    |  |  |  P2 (reserved)
-    //    |  |  P1 (slot 0)
-    //    |  INS_GEN_KEY
-    //    CLA
-    //
-    // Common Parsing Pattern for PIN-protected Operations:
-    // ```java
-    // byte slot = apdu.getBuffer()[ISO7816.OFFSET_P1];
-    // short dataLen = apdu.setIncomingAndReceive();
-    // byte[] buffer = apdu.getBuffer();
-    // byte pinLen = buffer[ISO7816.OFFSET_CDATA];
-    // 
-    // // Validate PIN length
-    // if (pinLen < 1 || pinLen > 8) {
-    //     ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-    // }
-    //
-    // // Validate total data length
-    // if (dataLen != (short)(1 + pinLen + 1)) {
-    //     ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-    // }
-    //
-    // // Extract PIN (copy for safety)
-    // byte[] pin = new byte[pinLen];
-    // Util.arrayCopy(buffer, (short)(ISO7816.OFFSET_CDATA + 1), pin, (short)0, pinLen);
-    //
-    // // Extract flags
-    // byte flags = buffer[ISO7816.OFFSET_CDATA + 1 + pinLen];
-    // ```
-    //
-    // Error Responses:
-    // - SW_SECURITY_STATUS_NOT_SATISFIED (0x6982): PIN verification failed
-    // - SW_KEY_EXISTS (0x6985): Key slot occupied (GEN_KEY only)
-    // - SW_KEY_NOT_FOUND (0x6A82): Key slot empty (CLEAR_KEY/REGEN_KEY only)
-    // - SW_WRONG_LENGTH (0x6700): Invalid APDU or PIN length
-    // - SW_SUCCESS (0x9000): Operation completed successfully
+    // =========================================================================
+    // Low-side instructions (0x01–0x08)
+    // =========================================================================
 
     /**
      * Generate a new EC P-256 keypair in a slot.
-     * BREAKING CHANGE: Now requires PIN verification.
-     * Uses unified PIN-protected APDU format (see above).
+     * P1 = slot (0–3).
+     * Data = [PIN_LEN][PIN][FLAGS] — unified PIN-protected format.
+     * Response = 65-byte uncompressed public key.
+     * Fails with SW_KEY_EXISTS (0x6985) if the slot is already occupied;
+     * use INS_REGEN_KEY to replace an existing key.
      */
     public static final byte INS_GEN_KEY = (byte) 0x01;
 
-    /** Return the raw 65-byte uncompressed public key for a slot. P1 = slot. */
+    /**
+     * Return the raw 65-byte uncompressed public key for a slot.
+     * P1 = slot (0–3).  No PIN required.
+     */
     public static final byte INS_GET_PUBKEY = (byte) 0x02;
 
     /**
      * Sign a pre-computed digest with the key in a slot.
-     * P1 = slot, P2 = flags (see FLAG_* below), Data = 32-byte digest.
-     * Response = DER-encoded ECDSA signature.
+     * P1 = slot (0–3), P2 = flags (FLAG_REQUIRE_PIN forces re-validation).
+     * Data = pre-computed hash digest (1–128 bytes; typically 32 for SHA-256).
+     * Response = DER-encoded ECDSA signature (max 72 bytes for P-256).
      *
-     * The host computes the hash (e.g. SHA-256) before sending. The card calls
-     * Signature.signPreComputedHash() so no re-hashing occurs on-card. This
-     * keeps hash algorithm selection entirely on the host side.
+     * The host computes the hash before sending; the card calls
+     * signPreComputedHash() and does NOT re-hash the input.
      */
     public static final byte INS_SIGN = (byte) 0x03;
 
-    /** Return a 1-byte bitmask of populated slots (bit N set → slot N has a key). */
+    /**
+     * Return a 1-byte bitmask of populated slots (bit N set → slot N has a key).
+     * No PIN required.
+     */
     public static final byte INS_LIST_KEYS = (byte) 0x04;
 
-    /** Verify the card PIN. Data = PIN bytes. */
+    /**
+     * Verify the card PIN for this session.
+     * Data = PIN bytes.
+     * On exhaustion triggers FLAG_ERASE_ON_LOCK for all eligible slots.
+     */
     public static final byte INS_VERIFY_PIN = (byte) 0x05;
 
     /**
-     * Change the card PIN.
-     * P1 = length of the old PIN.
-     * Data = old PIN bytes || new PIN bytes.
+     * Regenerate (replace) the keypair in a slot.
+     * P1 = slot (0–3).
+     * Data = [PIN_LEN][PIN][FLAGS] — unified PIN-protected format.
+     * Response = new 65-byte uncompressed public key.
+     * Does NOT check slot occupancy — use this to replace existing keys.
+     * Flags are set explicitly from the APDU; previous flags are NOT preserved.
      */
-    public static final byte INS_CHANGE_PIN = (byte) 0x06;
-
-    /** 
-     * Set per-key flags for a slot. P1 = slot, P2 = new flags byte.
-     * DEPRECATED: Use explicit flag setting in write operations instead.
-     */
-    public static final byte INS_SET_FLAGS = (byte) 0x07;
-
-    /**
-     * Regenerate the keypair in a slot (replaces any existing key).
-     * BREAKING CHANGE: Now requires PIN verification.
-     * Uses unified PIN-protected APDU format (see above).
-     */
-    public static final byte INS_REGEN_KEY = (byte) 0x08;
-
-    /**
-     * Unblock a blocked PIN using the PUK.
-     * P1 = length of the PUK.
-     * Data = PUK bytes || new PIN bytes.
-     */
-    public static final byte INS_UNBLOCK_PIN = (byte) 0x09;
+    public static final byte INS_REGEN_KEY = (byte) 0x06;
 
     /**
      * Clear (delete) a key from a slot.
-     * Uses unified PIN-protected APDU format.
-     * P1 = slot (0-3), Data = [PIN_LEN][PIN][FLAGS]
+     * P1 = slot (0–3).
+     * Data = [PIN_LEN][PIN][FLAGS] — unified format; FLAGS field is ignored.
+     * Safe to call on an empty slot (no-op).
      */
-    public static final byte INS_CLEAR_KEY = (byte) 0x0A;
+    public static final byte INS_CLEAR_KEY = (byte) 0x07;
 
     /**
-     * Get the flags byte for a specified slot.
-     * P1 = slot (0-3), P2 = unused, no data.
+     * Return the flags byte for a slot.
+     * P1 = slot (0–3).  No PIN required (read-only).
      * Response = 1-byte flags value.
      */
-    public static final byte INS_GET_FLAGS = (byte) 0x11;
+    public static final byte INS_GET_FLAGS = (byte) 0x08;
 
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // Admin block (0x7F downward): card lifecycle
+    // =========================================================================
+
+    /**
+     * One-time card initialization — sets the PIN and PUK.
+     *
+     * This is the ONLY instruction that works on an uninitialized card
+     * (besides SELECT).  Calling it again after initialization returns
+     * SW_SECURITY_STATUS_NOT_SATISFIED.
+     *
+     * APDU format:
+     * ```
+     * CLA INS P1       P2       Lc         Data
+     * 00  7F  PIN_LEN  PUK_LEN  PIN+PUK    [PIN bytes] || [PUK bytes]
+     * ```
+     * - P1: PIN length in bytes (1–8)
+     * - P2: PUK length in bytes (1–8)
+     * - Lc: P1 + P2
+     * - Data: PIN bytes immediately followed by PUK bytes
+     *
+     * Example — PIN "1234" (4 bytes), PUK "87654321" (8 bytes):
+     * ```
+     * 00 7F 04 08 0C 31 32 33 34 38 37 36 35 34 33 32 31
+     * ```
+     */
+    public static final byte INS_CARD_INIT = (byte) 0x7F;
+
+    /**
+     * Change the card PIN.
+     *
+     * P1 = old PIN length in bytes.
+     * Data = [old PIN bytes] || [new PIN bytes].
+     * Requires the current PIN; does not require a prior INS_VERIFY_PIN.
+     */
+    public static final byte INS_SET_PIN = (byte) 0x7E;
+
+    /**
+     * Change the card PUK.
+     *
+     * P1 = old PUK length in bytes.
+     * Data = [old PUK bytes] || [new PUK bytes].
+     * Requires the current PUK.
+     */
+    public static final byte INS_SET_PUK = (byte) 0x7D;
+
+    /**
+     * Unblock a blocked PIN using the PUK and set a new PIN.
+     *
+     * P1 = PUK length in bytes.
+     * Data = [PUK bytes] || [new PIN bytes].
+     * On success the PIN try counter is reset and the new PIN is active.
+     * If the PUK is permanently blocked (tries exhausted) this returns
+     * SW_PIN_BLOCKED; the only recovery is INS_RESET_CARD.
+     */
+    public static final byte INS_UNBLOCK_CARD = (byte) 0x7C;
+
+    /**
+     * Factory reset — wipe all keys and credentials, return card to fresh
+     * installed state (initialized = false).
+     *
+     * This is the "I forgot everything, blow it all away" escape hatch.
+     * No PIN or PUK is required, making it usable even when locked out.
+     * To prevent accidental resets the operation is two-phase:
+     *
+     * **Phase 1** — no data (Lc absent or 0):
+     *   Card generates a 16-byte cryptographic nonce, stores it in transient
+     *   memory (CLEAR_ON_DESELECT), and returns it.  If you deselect before
+     *   completing Phase 2 the nonce is gone and you must restart.
+     *
+     * **Phase 2** — Data = the 16-byte nonce returned by Phase 1:
+     *   Card verifies the nonce.  On match it atomically erases all key
+     *   material, resets PIN/PUK counters, and sets initialized = false.
+     *   On mismatch the nonce is immediately invalidated and
+     *   SW_SECURITY_STATUS_NOT_SATISFIED is returned.
+     *
+     * After a successful reset INS_CARD_INIT must be called before any
+     * other operation.
+     */
+    public static final byte INS_RESET_CARD = (byte) 0x7B;
+
+    // =========================================================================
     // Per-key flag bits  (stored in keyFlags[], also used in P2 of INS_SIGN)
     //
     //  7       6  5  4    3        2  1  0
@@ -156,7 +201,7 @@ public final class APDUConstants {
     // │ REQ   │ TIMEOUT  │ ERASE   │ RES  │
     // │ PIN   │ (0–7)    │ ON LOCK │      │
     // └───────┴──────────┴─────────┴──────┘
-    // -------------------------------------------------------------------------
+    // =========================================================================
 
     /** Bit 7: require PIN validation before signing with this key. */
     public static final byte FLAG_REQUIRE_PIN = (byte) 0x80;
@@ -170,18 +215,18 @@ public final class APDUConstants {
     /** Bit 3: erase this key's material when the PIN becomes blocked. */
     public static final byte FLAG_ERASE_ON_LOCK = (byte) 0x08;
 
-    // -------------------------------------------------------------------------
+    // =========================================================================
     // Status words (SW1 SW2)
-    // -------------------------------------------------------------------------
+    // =========================================================================
 
     /** 0x9000 — command completed successfully. */
     public static final short SW_SUCCESS = (short) 0x9000;
 
-    /** 0x6983 — PIN blocked; PUK required to unblock. */
+    /** 0x6983 — PIN blocked; PUK required to unblock, or use RESET_CARD. */
     public static final short SW_PIN_BLOCKED = (short) 0x6983;
 
     /**
-     * 0x63Cx — wrong PIN; the low nibble x carries the remaining try count.
+     * 0x63Cx — wrong PIN/PUK; low nibble x carries the remaining try count.
      * Construct with: (short)(SW_WRONG_PIN_BASE | triesRemaining)
      */
     public static final short SW_WRONG_PIN_BASE = (short) 0x63C0;
@@ -189,9 +234,14 @@ public final class APDUConstants {
     /** 0x6A82 — referenced key slot is empty. */
     public static final short SW_KEY_NOT_FOUND = (short) 0x6A82;
 
-    /** 0x6982 — security status not satisfied (PIN required/verification failed). */
+    /**
+     * 0x6982 — security status not satisfied.
+     * Used for: PIN required/failed, calling an instruction on an
+     * uninitialized card, calling INS_CARD_INIT on an already-initialized
+     * card, and wrong nonce in INS_RESET_CARD Phase 2.
+     */
     public static final short SW_SECURITY_STATUS_NOT_SATISFIED = (short) 0x6982;
 
-    /** 0x6985 — conditions of use not satisfied (e.g., key slot already occupied). */
+    /** 0x6985 — conditions not satisfied (e.g., key slot already occupied). */
     public static final short SW_KEY_EXISTS = (short) 0x6985;
 }

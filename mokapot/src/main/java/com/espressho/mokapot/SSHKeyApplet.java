@@ -8,73 +8,64 @@ import javacardx.crypto.*;
  * SSHKeyApplet — Mokapot JavaCard applet.
  *
  * Stores up to 4 EC P-256 keypairs in EEPROM and exposes them for SSH signing
- * via the APDU interface described in CLAUDE.md.
- *
- * **Security Model:**
- * - Read operations (GET_PUBKEY, LIST_KEYS): No PIN required
- * - Write operations (GEN_KEY, REGEN_KEY, CLEAR_KEY): PIN verification required
- * - All write operations use unified APDU format: [PIN_LEN][PIN][FLAGS]
- * - GEN_KEY fails on occupied slots; use REGEN_KEY for replacement
- * - All flag setting is explicit (no inheritance/preservation)
+ * via the APDU interface described in CLAUDE.md and doc/APDU-Protocol-Specification.md.
  *
  * AID:
- *   Package : CA FE 4D 6F 6B 61        (6 bytes, "CafeMok[a]")  
+ *   Package : CA FE 4D 6F 6B 61        (6 bytes, "CafeMok[a]")
  *   Applet  : CA FE 4D 6F 6B 61 00 01 00 00 00 00 00 00 00 00 (16 bytes)
+ *
+ * ## Card lifecycle
+ *
+ * After installation the card is **uninitialized**.  Only SELECT and
+ * INS_CARD_INIT (0xA0) are accepted.  Every other instruction returns
+ * SW_SECURITY_STATUS_NOT_SATISFIED (0x6982) until CARD_INIT has been called.
+ *
+ * CARD_INIT sets the PIN and PUK and flips the persistent `initialized` flag.
+ * From that point the full instruction set is available.
+ *
+ * INS_RESET_CARD (0xA4) is a two-phase nuclear reset that returns the card to
+ * the uninitialized state without requiring any credentials.  It is the escape
+ * hatch for "I locked myself out and/or need to hand the card to someone else."
+ *
+ * ## Security model
+ *
+ * Read operations (GET_PUBKEY, LIST_KEYS, GET_FLAGS): no PIN required.
+ * Write operations (GEN_KEY, REGEN_KEY, CLEAR_KEY): PIN embedded in APDU.
+ * Admin operations (SET_PIN, SET_PUK, UNBLOCK_CARD): require respective secret.
+ * RESET_CARD: two-phase nonce only — no credentials needed.
  *
  * All signing is performed on-card; private key material never leaves the card.
  * The host only ever receives DER-encoded ECDSA signatures and raw public keys.
  *
- * PIN notes:
- *   - Default PIN  : "1234" (must be changed before production use)
- *   - Default PUK  : "12345678"
- *   - Max PIN tries: 3 — card blocks on exhaustion
- *   - Max PUK tries: 5 — PUK blocks if exhausted (card is permanently locked)
- *   - PIN state resets on deselect / power-off (OwnerPIN semantics)
- *   - Timeout enforcement (FLAG_TIMEOUT) is the host's responsibility; the card
- *     only tracks whether the PIN has been verified this session.
+ * ## PIN notes
  *
- * **Implementation Notes:**
- * - PIN protection for all write operations
- * - Unified APDU format for GEN_KEY/REGEN_KEY/CLEAR_KEY
- * - Slot occupancy protection in GEN_KEY
- * - Explicit flag model (no flag preservation)
- * - New error codes: SW_KEY_EXISTS (0x6985)
+ * - No default PIN/PUK — credentials are set by INS_CARD_INIT.
+ * - Max PIN tries: 3 — card blocks on exhaustion; PUK or RESET required.
+ * - Max PUK tries: 5 — PUK permanently blocks if exhausted; RESET required.
+ * - PIN session state resets on deselect / power-off (OwnerPIN semantics).
+ * - Timeout enforcement (FLAG_TIMEOUT) is the host's responsibility; the card
+ *   only tracks whether the PIN has been verified this session.
  */
 public class SSHKeyApplet extends Applet {
 
-    // -------------------------------------------------------------------------
-    // Limits and defaults
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // Limits
+    // =========================================================================
 
-    private static final byte MAX_KEYS = (byte) 4;
-    private static final byte PIN_MAX_TRIES = (byte) 3;
-    private static final byte PUK_MAX_TRIES = (byte) 5;
+    private static final byte  MAX_KEYS        = (byte)  4;
+    private static final byte  PIN_MAX_TRIES   = (byte)  3;
+    private static final byte  PUK_MAX_TRIES   = (byte)  5;
+    private static final byte  PIN_MAX_LEN     = (byte)  8;
+    private static final byte  PUK_MAX_LEN     = (byte)  8;
+    private static final short PUBKEY_LEN      = (short) 65;
+    /** Length of the factory-reset confirmation nonce in bytes. */
+    private static final short RESET_NONCE_LEN = (short) 16;
 
-    /** Maximum PIN length in bytes. */
-    private static final byte PIN_MAX_LEN = (byte) 8;
-    /** Maximum PUK length in bytes. */
-    private static final byte PUK_MAX_LEN = (byte) 8;
+    // =========================================================================
+    // Persistent state (EEPROM — survives power-off)
+    // =========================================================================
 
-    private static final byte[] DEFAULT_PIN = { '1', '2', '3', '4' };
-    private static final byte[] DEFAULT_PUK = {
-        '1',
-        '2',
-        '3',
-        '4',
-        '5',
-        '6',
-        '7',
-        '8',
-    };
-
-    /** Raw length of an uncompressed P-256 point: 04 || X(32) || Y(32). */
-    private static final short PUBKEY_LEN = (short) 65;
-
-    // -------------------------------------------------------------------------
-    // Persistent state (EEPROM)
-    // -------------------------------------------------------------------------
-
-    /** Up to 4 keypairs. Null slot = empty. */
+    /** Up to 4 keypairs.  Null slot = empty. */
     private KeyPair[] keyPairs;
 
     /** Per-slot flag byte (see APDUConstants.FLAG_*). */
@@ -86,51 +77,64 @@ public class SSHKeyApplet extends Applet {
     /** PUK — used only to unblock a blocked PIN. */
     private OwnerPIN puk;
 
-    // -------------------------------------------------------------------------
-    // Transient state (cleared on deselect / power-off)
-    // -------------------------------------------------------------------------
+    /**
+     * Whether INS_CARD_INIT has been called.  All instructions except SELECT
+     * and INS_CARD_INIT are gated behind this flag.  Persists across power
+     * cycles; cleared only by a successful INS_RESET_CARD.
+     */
+    private boolean initialized;
+
+    // =========================================================================
+    // Transient state (CLEAR_ON_DESELECT — wiped on card deselect/power-off)
+    // =========================================================================
 
     /**
-     * Scratch buffer for public key export. Transient so we never accidentally
-     * retain a public key value across sessions in RAM.
+     * Scratch buffer for public key export.  Transient so a public key value
+     * is never accidentally retained across sessions in RAM.
      */
     private byte[] pubKeyScratch;
 
-    // -------------------------------------------------------------------------
-    // Shared Signature instance (reused across sign operations)
-    // -------------------------------------------------------------------------
+    /**
+     * Pending factory-reset nonce.  Generated by Phase 1 of INS_RESET_CARD and
+     * consumed (or invalidated) by Phase 2.  CLEAR_ON_DESELECT zeroes this on
+     * deselect, which also serves as the "no nonce pending" sentinel — a fully
+     * zeroed array means no Phase 1 has been issued this session.
+     */
+    private byte[] resetNonce;
+
+    // =========================================================================
+    // Shared crypto instances (allocated once, reused)
+    // =========================================================================
 
     /**
-     * ALG_ECDSA_SHA_256 with signPreComputedHash(): the host pre-computes the SHA-256 hash
-     * and sends it to the card. The card signs the digest directly using ECDSA without
-     * any internal hashing. This keeps hash algorithm selection entirely on the host side.
+     * ALG_ECDSA_SHA_256 with signPreComputedHash(): the host pre-computes the
+     * hash and the card signs the digest directly without internal re-hashing.
      */
     private Signature signer;
 
-    // -------------------------------------------------------------------------
+    /** Secure random number generator — used for factory-reset nonce. */
+    private RandomData rng;
+
+    // =========================================================================
     // Constructor / install
-    // -------------------------------------------------------------------------
+    // =========================================================================
 
     protected SSHKeyApplet() {
-        // Set up PIN and PUK with default values.
+        // PIN and PUK objects must be allocated at install time (EEPROM slots).
+        // Credentials are NOT set here — they are established by INS_CARD_INIT.
         pin = new OwnerPIN(PIN_MAX_TRIES, PIN_MAX_LEN);
-        pin.update(DEFAULT_PIN, (short) 0, (byte) DEFAULT_PIN.length);
-
         puk = new OwnerPIN(PUK_MAX_TRIES, PUK_MAX_LEN);
-        puk.update(DEFAULT_PUK, (short) 0, (byte) DEFAULT_PUK.length);
 
-        // Allocate key slot arrays in EEPROM.
         keyPairs = new KeyPair[MAX_KEYS];
         keyFlags = new byte[MAX_KEYS];
 
-        // Shared signer instance — init before each use in handleSign().
-        signer = Signature.getInstance(Signature.ALG_ECDSA_SHA_256, false);
+        // initialized defaults to false (EEPROM boolean zero-initialisation).
 
-        // Transient scratch buffer for public key bytes.
-        pubKeyScratch = JCSystem.makeTransientByteArray(
-            PUBKEY_LEN,
-            JCSystem.CLEAR_ON_DESELECT
-        );
+        signer = Signature.getInstance(Signature.ALG_ECDSA_SHA_256, false);
+        rng    = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
+
+        pubKeyScratch = JCSystem.makeTransientByteArray(PUBKEY_LEN,      JCSystem.CLEAR_ON_DESELECT);
+        resetNonce    = JCSystem.makeTransientByteArray(RESET_NONCE_LEN, JCSystem.CLEAR_ON_DESELECT);
 
         register();
     }
@@ -139,13 +143,14 @@ public class SSHKeyApplet extends Applet {
         new SSHKeyApplet();
     }
 
-    // -------------------------------------------------------------------------
+    // =========================================================================
     // APDU dispatch
-    // -------------------------------------------------------------------------
+    // =========================================================================
 
     public void process(APDU apdu) throws ISOException {
+        // The framework handles SELECT before reaching here.
         if (selectingApplet()) {
-            return; // SELECT accepted; nothing to respond beyond SW 9000.
+            return;
         }
 
         byte[] buf = apdu.getBuffer();
@@ -154,7 +159,15 @@ public class SSHKeyApplet extends Applet {
             ISOException.throwIt(ISO7816.SW_CLA_NOT_SUPPORTED);
         }
 
-        switch (buf[ISO7816.OFFSET_INS]) {
+        byte ins = buf[ISO7816.OFFSET_INS];
+
+        // Gate: every instruction except INS_CARD_INIT requires initialization.
+        // An uninitialized card only accepts SELECT (handled above) and CARD_INIT.
+        if (!initialized && ins != APDUConstants.INS_CARD_INIT) {
+            ISOException.throwIt(APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+
+        switch (ins) {
             case APDUConstants.INS_GEN_KEY:
                 handleGenKey(apdu);
                 break;
@@ -170,17 +183,8 @@ public class SSHKeyApplet extends Applet {
             case APDUConstants.INS_VERIFY_PIN:
                 handleVerifyPIN(apdu);
                 break;
-            case APDUConstants.INS_CHANGE_PIN:
-                handleChangePIN(apdu);
-                break;
-            case APDUConstants.INS_SET_FLAGS:
-                handleSetFlags(apdu);
-                break;
             case APDUConstants.INS_REGEN_KEY:
                 handleRegenKey(apdu);
-                break;
-            case APDUConstants.INS_UNBLOCK_PIN:
-                handleUnblockPIN(apdu);
                 break;
             case APDUConstants.INS_CLEAR_KEY:
                 handleClearKey(apdu);
@@ -188,53 +192,49 @@ public class SSHKeyApplet extends Applet {
             case APDUConstants.INS_GET_FLAGS:
                 handleGetFlags(apdu);
                 break;
+            // Admin block -------------------------------------------------------
+            case APDUConstants.INS_CARD_INIT:
+                handleCardInit(apdu);
+                break;
+            case APDUConstants.INS_SET_PIN:
+                handleSetPIN(apdu);
+                break;
+            case APDUConstants.INS_SET_PUK:
+                handleSetPUK(apdu);
+                break;
+            case APDUConstants.INS_UNBLOCK_CARD:
+                handleUnblockCard(apdu);
+                break;
+            case APDUConstants.INS_RESET_CARD:
+                handleResetCard(apdu);
+                break;
             default:
                 ISOException.throwIt(ISO7816.SW_INS_NOT_SUPPORTED);
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Instruction handlers
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // Normal instruction handlers (0x01–0x08)
+    // =========================================================================
 
     /**
      * INS_GEN_KEY (0x01) — generate a new keypair in the specified slot.
      *
-     * **BREAKING CHANGE:** Now requires PIN verification and fails if slot is occupied.
+     * APDU format: [PIN_LEN][PIN][FLAGS]
+     * P1 = slot (0–3), P2 = reserved (0x00).
      *
-     * APDU Format: [PIN_LEN][PIN][FLAGS]
-     * - PIN_LEN: 1 byte (range: 1-8)
-     * - PIN: Variable-length PIN data (1-8 bytes)
-     * - FLAGS: Security flags byte (see APDUConstants.FLAG_*)
+     * Fails with SW_KEY_EXISTS if the slot is already occupied; use
+     * INS_REGEN_KEY to replace an existing key.
      *
-     * P1 = slot (0–3)
-     * P2 = reserved (must be 0x00)
-     * Data = PIN length + PIN bytes + flags byte
-     *
-     * Security Policy:
-     * - Requires PIN verification before proceeding
-     * - Fails with SW_KEY_EXISTS if slot is already occupied
-     * - Use INS_REGEN_KEY to replace existing keys
-     *
-     * Returns:
-     * - SW_KEY_EXISTS (0x6985): Slot occupied, use INS_REGEN_KEY
-     * - SW_SECURITY_STATUS_NOT_SATISFIED (0x6982): PIN verification failed
-     * - SW_WRONG_DATA (0x6A80): Invalid flags (reserved bits set)
-     * - SW_WRONG_LENGTH (0x6700): Invalid APDU or PIN length
-     * - SW_9000: Success + new 65-byte uncompressed public key in response
-     *
-     * Transaction Safety: Key generation and flag setting are atomic.
-     * Implementation: Uses makeP256KeyPair() with proper domain parameter setting.
+     * Returns the 65-byte uncompressed public key on success.
      */
     private void handleGenKey(APDU apdu) {
         byte[] buf = apdu.getBuffer();
         byte slot = buf[ISO7816.OFFSET_P1];
         checkSlot(slot);
 
-        // Parse APDU: [PIN_LEN][PIN][FLAGS]
         short dataLen = apdu.setIncomingAndReceive();
         if (dataLen < 2) {
-            // Minimum: PIN_LEN + FLAGS
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
 
@@ -242,48 +242,40 @@ public class SSHKeyApplet extends Applet {
         if (pinLen < 1 || pinLen > PIN_MAX_LEN) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
-
-        // Validate total data length
         if (dataLen != (short) (1 + pinLen + 1)) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
 
-        // Verify PIN
         if (!pin.check(buf, (short) (ISO7816.OFFSET_CDATA + 1), pinLen)) {
-            ISOException.throwIt(
-                APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED
-            );
+            ISOException.throwIt(APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED);
         }
 
-        // Check slot occupancy - NEW PROTECTION with defensive programming
+        // Refuse to silently overwrite an existing key.
         try {
-            if (
-                keyPairs[slot] != null &&
+            if (keyPairs[slot] != null &&
                 keyPairs[slot].getPrivate() != null &&
-                keyPairs[slot].getPrivate().isInitialized()
-            ) {
+                keyPairs[slot].getPrivate().isInitialized()) {
                 ISOException.throwIt(APDUConstants.SW_KEY_EXISTS);
             }
+        } catch (ISOException iso) {
+            throw iso;
         } catch (Exception e) {
-            // Treat any exception as "not initialized" - defensive approach
+            // Treat any other exception as "not initialized" — defensive.
         }
 
-        // Extract flags
         byte flags = buf[ISO7816.OFFSET_CDATA + 1 + pinLen];
         validateFlags(flags);
 
-        // Generate key pair - simplified without transaction for testing
         KeyPair kp = makeP256KeyPair();
         keyPairs[slot] = kp;
-        keyFlags[slot] = flags; // Set explicit flags from APDU
-        
-        // Return public key as convenience (65-byte uncompressed format)
+        keyFlags[slot] = flags;
+
         returnUncompressedPublicKey(apdu, kp);
     }
 
     /**
      * INS_GET_PUBKEY (0x02) — return the 65-byte uncompressed public key for a slot.
-     * P1 = slot (0–3).
+     * P1 = slot (0–3).  No PIN required.
      */
     private void handleGetPubKey(APDU apdu) {
         byte slot = apdu.getBuffer()[ISO7816.OFFSET_P1];
@@ -302,25 +294,20 @@ public class SSHKeyApplet extends Applet {
      * INS_SIGN (0x03) — sign a pre-computed hash with the key in a slot.
      *
      * P1 = slot (0–3)
-     * P2 = flags (FLAG_REQUIRE_PIN may be set here to force re-validation
-     *             regardless of the slot's stored flags)
-     * Data = pre-computed hash digest (exactly 32 bytes for SHA-256)
+     * P2 = flags (FLAG_REQUIRE_PIN forces re-validation regardless of slot flags)
+     * Data = pre-computed hash digest (1–128 bytes; typically 32 for SHA-256)
      * Response = DER-encoded ECDSA signature (max 72 bytes for P-256)
      *
-     * The host is responsible for hashing. The card calls signPreComputedHash()
-     * (JavaCard 3.0.5 API) so the Signature engine does NOT re-hash the input.
-     * This keeps hash algorithm choice entirely on the host side.
-     *
-     * CLAUDE.md §SIGN Instruction Detail
+     * The host is responsible for hashing.  The card calls
+     * signPreComputedHash() — NO internal hashing occurs.
      */
     private void handleSign(APDU apdu) {
         byte[] buf = apdu.getBuffer();
-        byte slot = buf[ISO7816.OFFSET_P1];
+        byte slot  = buf[ISO7816.OFFSET_P1];
         byte flags = buf[ISO7816.OFFSET_P2];
         checkSlot(slot);
         checkKeyPresent(slot);
 
-        // Require PIN if either the slot's stored flags or the APDU flags say so.
         boolean requirePIN =
             ((keyFlags[slot] | flags) & APDUConstants.FLAG_REQUIRE_PIN) != 0;
         if (requirePIN && !pin.isValidated()) {
@@ -328,27 +315,17 @@ public class SSHKeyApplet extends Applet {
         }
 
         short digestLen = apdu.setIncomingAndReceive();
-        // Digest must be at least 1 byte and fit in the APDU buffer.
-        // signPreComputedHash() accepts any digest length; for P-256 the
-        // ECDSA standard (FIPS 186-4 §6.4) uses the leftmost 256 bits, so
-        // SHA-512 / SHA3-512 (64 bytes) work correctly without truncation here.
+        // signPreComputedHash() accepts any digest length; 128 bytes is a
+        // generous upper bound covering SHA-512 and similar outputs.
         if (digestLen < (short) 1 || digestLen > (short) 128) {
-            // 128 bytes (1024 bits) is a generous upper bound covering any plausible
-            // hash output. Anything wider is almost certainly a mistake or misuse.
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
 
-        // signPreComputedHash() signs the raw digest bytes without any internal
-        // hashing. The response overwrites buf from offset 0, which is safe
-        // because APDU input has already been fully received.
         ECPrivateKey privKey = (ECPrivateKey) keyPairs[slot].getPrivate();
         signer.init(privKey, Signature.MODE_SIGN);
         short sigLen = signer.signPreComputedHash(
-            buf,
-            ISO7816.OFFSET_CDATA,
-            digestLen,
-            buf,
-            (short) 0
+            buf, ISO7816.OFFSET_CDATA, digestLen,
+            buf, (short) 0
         );
 
         apdu.setOutgoing();
@@ -358,19 +335,15 @@ public class SSHKeyApplet extends Applet {
 
     /**
      * INS_LIST_KEYS (0x04) — return a 1-byte bitmask of populated slots.
-     * Bit N is set if slot N contains a key.
+     * Bit N is set if slot N contains an initialized key.  No PIN required.
      */
     private void handleListKeys(APDU apdu) {
         byte mask = 0;
-        for (byte slotIndex = 0; slotIndex < MAX_KEYS; slotIndex++) {
-            if (
-                keyPairs[slotIndex] != null &&
-                keyPairs[slotIndex].getPrivate().isInitialized()
-            ) {
-                mask |= (byte) (1 << slotIndex);
+        for (byte i = 0; i < MAX_KEYS; i++) {
+            if (keyPairs[i] != null && keyPairs[i].getPrivate().isInitialized()) {
+                mask |= (byte) (1 << i);
             }
         }
-
         byte[] buf = apdu.getBuffer();
         buf[0] = mask;
         apdu.setOutgoing();
@@ -382,8 +355,8 @@ public class SSHKeyApplet extends Applet {
      * INS_VERIFY_PIN (0x05) — verify the card PIN for this session.
      * Data = PIN bytes.
      *
-     * On failure returns 0x63Cx (x = tries remaining) or 0x6983 (blocked).
-     * On exhaustion of tries, triggers FLAG_ERASE_ON_LOCK for all eligible slots.
+     * Returns 0x63Cx (x = tries remaining) on failure, 0x6983 if blocked.
+     * On exhaustion triggers FLAG_ERASE_ON_LOCK for all eligible slots.
      */
     private void handleVerifyPIN(APDU apdu) {
         byte[] buf = apdu.getBuffer();
@@ -395,27 +368,203 @@ public class SSHKeyApplet extends Applet {
 
         if (!pin.check(buf, ISO7816.OFFSET_CDATA, (byte) dataLen)) {
             if (pin.getTriesRemaining() == 0) {
-                // PIN just became blocked — erase any FLAG_ERASE_ON_LOCK keys.
                 eraseLockedKeys();
                 ISOException.throwIt(APDUConstants.SW_PIN_BLOCKED);
             }
             ISOException.throwIt(
-                (short) (APDUConstants.SW_WRONG_PIN_BASE |
-                    pin.getTriesRemaining())
+                (short) (APDUConstants.SW_WRONG_PIN_BASE | pin.getTriesRemaining())
             );
         }
-        // Success: SW 9000 sent automatically.
+        // Success — SW 9000 sent automatically.
     }
 
     /**
-     * INS_CHANGE_PIN (0x06) — change the card PIN.
-     * P1 = length of the old PIN.
-     * Data = old PIN bytes || new PIN bytes.
+     * INS_REGEN_KEY (0x06) — regenerate (replace) the keypair in a slot.
      *
-     * Requires the old PIN to be presented; does not require a prior
-     * INS_VERIFY_PIN for this session.
+     * APDU format: [PIN_LEN][PIN][FLAGS]
+     * P1 = slot (0–3), P2 = reserved (0x00).
+     * Response = new 65-byte uncompressed public key.
+     *
+     * Replaces any existing key without an occupancy check.
+     * Flags are set explicitly from the APDU; previous flags are NOT preserved.
      */
-    private void handleChangePIN(APDU apdu) {
+    private void handleRegenKey(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        byte slot = buf[ISO7816.OFFSET_P1];
+        checkSlot(slot);
+
+        short dataLen = apdu.setIncomingAndReceive();
+        if (dataLen < 2) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+
+        byte pinLen = buf[ISO7816.OFFSET_CDATA];
+        if (pinLen < 1 || pinLen > PIN_MAX_LEN) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        if (dataLen != (short) (1 + pinLen + 1)) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+
+        if (!pin.check(buf, (short) (ISO7816.OFFSET_CDATA + 1), pinLen)) {
+            ISOException.throwIt(APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+
+        byte flags = buf[ISO7816.OFFSET_CDATA + 1 + pinLen];
+        validateFlags(flags);
+
+        JCSystem.beginTransaction();
+        try {
+            KeyPair kp = makeP256KeyPair();
+            keyPairs[slot] = kp;
+            keyFlags[slot] = flags;
+            JCSystem.commitTransaction();
+        } catch (ISOException iso) {
+            JCSystem.abortTransaction();
+            throw iso;
+        } catch (Exception e) {
+            JCSystem.abortTransaction();
+            ISOException.throwIt(ISO7816.SW_UNKNOWN);
+        }
+
+        returnUncompressedPublicKey(apdu, keyPairs[slot]);
+    }
+
+    /**
+     * INS_CLEAR_KEY (0x07) — securely delete a keypair from a slot.
+     *
+     * APDU format: [PIN_LEN][PIN][FLAGS]
+     * P1 = slot (0–3), P2 = reserved (0x00).
+     * FLAGS field must be valid (reserved bits zero) but its value is ignored.
+     * Safe to call on an empty slot.
+     */
+    private void handleClearKey(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        byte slot = buf[ISO7816.OFFSET_P1];
+        checkSlot(slot);
+
+        short dataLen = apdu.setIncomingAndReceive();
+        if (dataLen < 2) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+
+        byte pinLen = buf[ISO7816.OFFSET_CDATA];
+        if (pinLen < 1 || pinLen > PIN_MAX_LEN) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        if (dataLen != (short) (1 + pinLen + 1)) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+
+        if (!pin.check(buf, (short) (ISO7816.OFFSET_CDATA + 1), pinLen)) {
+            ISOException.throwIt(APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+
+        // FLAGS must be valid even though ignored, to keep the format honest.
+        byte flags = buf[ISO7816.OFFSET_CDATA + 1 + pinLen];
+        validateFlags(flags);
+
+        JCSystem.beginTransaction();
+        try {
+            if (keyPairs[slot] != null) {
+                keyPairs[slot].getPrivate().clearKey();
+                keyPairs[slot].getPublic().clearKey();
+                keyPairs[slot] = null;
+            }
+            keyFlags[slot] = 0;
+            JCSystem.commitTransaction();
+        } catch (ISOException iso) {
+            JCSystem.abortTransaction();
+            throw iso;
+        } catch (Exception e) {
+            JCSystem.abortTransaction();
+            ISOException.throwIt(ISO7816.SW_UNKNOWN);
+        }
+    }
+
+    /**
+     * INS_GET_FLAGS (0x08) — return the flags byte for a slot.
+     * P1 = slot (0–3).  No PIN required (read-only).
+     * Response = 1-byte flags value.
+     */
+    private void handleGetFlags(APDU apdu) {
+        byte slot = apdu.getBuffer()[ISO7816.OFFSET_P1];
+        checkSlot(slot);
+        checkKeyPresent(slot);
+
+        byte[] buf = apdu.getBuffer();
+        buf[0] = keyFlags[slot];
+        apdu.setOutgoing();
+        apdu.setOutgoingLength((short) 1);
+        apdu.sendBytes((short) 0, (short) 1);
+    }
+
+    // =========================================================================
+    // Admin instruction handlers (0xA0–0xA4)
+    // =========================================================================
+
+    /**
+     * INS_CARD_INIT (0xA0) — one-time card initialization.
+     *
+     * Sets the PIN and PUK and marks the card as initialized.  This is the
+     * only instruction (besides SELECT) that works on an uninitialized card.
+     * Calling it on an already-initialized card returns
+     * SW_SECURITY_STATUS_NOT_SATISFIED.
+     *
+     * APDU format:
+     *   P1 = PIN length (1–8)
+     *   P2 = PUK length (1–8)
+     *   Data = [PIN bytes] || [PUK bytes]
+     */
+    private void handleCardInit(APDU apdu) {
+        if (initialized) {
+            // Re-initialization is not permitted.
+            ISOException.throwIt(APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+
+        byte[] buf = apdu.getBuffer();
+        byte pinLen = buf[ISO7816.OFFSET_P1];
+        byte pukLen = buf[ISO7816.OFFSET_P2];
+
+        if (pinLen < 1 || pinLen > PIN_MAX_LEN) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        if (pukLen < 1 || pukLen > PUK_MAX_LEN) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+
+        short dataLen = apdu.setIncomingAndReceive();
+        if (dataLen != (short) (pinLen + pukLen)) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+
+        // Atomically set both credentials and flip the initialized flag.
+        JCSystem.beginTransaction();
+        try {
+            pin.update(buf, ISO7816.OFFSET_CDATA, pinLen);
+            puk.update(buf, (short) (ISO7816.OFFSET_CDATA + pinLen), pukLen);
+            initialized = true;
+            JCSystem.commitTransaction();
+        } catch (ISOException iso) {
+            JCSystem.abortTransaction();
+            throw iso;
+        } catch (Exception e) {
+            JCSystem.abortTransaction();
+            ISOException.throwIt(ISO7816.SW_UNKNOWN);
+        }
+        // Success — SW 9000 sent automatically.
+    }
+
+    /**
+     * INS_SET_PIN (0xA1) — change the card PIN.
+     *
+     * P1 = old PIN length.
+     * Data = [old PIN bytes] || [new PIN bytes].
+     *
+     * Does not require a prior INS_VERIFY_PIN — the old PIN is verified inline.
+     * On exhaustion of tries, triggers FLAG_ERASE_ON_LOCK for eligible slots.
+     */
+    private void handleSetPIN(APDU apdu) {
         byte[] buf = apdu.getBuffer();
         byte oldPINLen = buf[ISO7816.OFFSET_P1];
         short totalLen = apdu.setIncomingAndReceive();
@@ -431,19 +580,16 @@ public class SSHKeyApplet extends Applet {
             ISOException.throwIt(APDUConstants.SW_PIN_BLOCKED);
         }
 
-        // Verify old PIN. We use pin.check() which counts against the try counter.
         if (!pin.check(buf, ISO7816.OFFSET_CDATA, oldPINLen)) {
             if (pin.getTriesRemaining() == 0) {
                 eraseLockedKeys();
                 ISOException.throwIt(APDUConstants.SW_PIN_BLOCKED);
             }
             ISOException.throwIt(
-                (short) (APDUConstants.SW_WRONG_PIN_BASE |
-                    pin.getTriesRemaining())
+                (short) (APDUConstants.SW_WRONG_PIN_BASE | pin.getTriesRemaining())
             );
         }
 
-        // Add transaction protection around PIN update
         JCSystem.beginTransaction();
         try {
             pin.update(buf, newPINOffset, newPINLen);
@@ -452,213 +598,63 @@ public class SSHKeyApplet extends Applet {
             JCSystem.abortTransaction();
             throw e;
         }
-        // Success: SW 9000 sent automatically.
+        // Success — SW 9000 sent automatically.
     }
 
     /**
-     * INS_SET_FLAGS (0x07) — set per-key flags for a slot.
-     * P1 = slot (0–3), P2 = new flags byte.
-     * 
-     * DEPRECATED: Use explicit flag setting in write operations (GEN_KEY, REGEN_KEY) instead.
-     * This instruction remains for backward compatibility but should not be used in new applications.
-     * 
-     * SECURITY: Requires PIN verification to prevent flag manipulation attacks.
+     * INS_SET_PUK (0xA2) — change the card PUK.
+     *
+     * P1 = old PUK length.
+     * Data = [old PUK bytes] || [new PUK bytes].
+     *
+     * Requires the current PUK.  If the PUK try counter is exhausted the
+     * only recovery is INS_RESET_CARD.
      */
-    private void handleSetFlags(APDU apdu) {
+    private void handleSetPUK(APDU apdu) {
         byte[] buf = apdu.getBuffer();
-        byte slot = buf[ISO7816.OFFSET_P1];
-        byte flags = buf[ISO7816.OFFSET_P2];
-        checkSlot(slot);
-        checkKeyPresent(slot);
+        byte oldPUKLen = buf[ISO7816.OFFSET_P1];
+        short totalLen = apdu.setIncomingAndReceive();
 
-        // CRITICAL FIX: Require PIN verification to prevent authentication bypass
-        if (!pin.isValidated()) {
+        if (oldPUKLen <= 0 || oldPUKLen >= totalLen) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+
+        short newPUKOffset = (short) (ISO7816.OFFSET_CDATA + oldPUKLen);
+        byte newPUKLen = (byte) (totalLen - oldPUKLen);
+
+        if (puk.getTriesRemaining() == 0) {
+            // PUK is permanently blocked — only RESET_CARD can recover from this.
+            ISOException.throwIt(APDUConstants.SW_PIN_BLOCKED);
+        }
+
+        if (!puk.check(buf, ISO7816.OFFSET_CDATA, oldPUKLen)) {
             ISOException.throwIt(
-                APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED
+                (short) (APDUConstants.SW_WRONG_PIN_BASE | puk.getTriesRemaining())
             );
         }
 
-        // CRITICAL FIX: Validate flags to prevent reserved bit corruption
-        validateFlags(flags);
-
-        // Add transaction protection around flag assignment
         JCSystem.beginTransaction();
         try {
-            keyFlags[slot] = flags;
+            puk.update(buf, newPUKOffset, newPUKLen);
             JCSystem.commitTransaction();
         } catch (Exception e) {
             JCSystem.abortTransaction();
             throw e;
         }
-        // Success: SW 9000 sent automatically.
+        // Success — SW 9000 sent automatically.
     }
 
     /**
-     * INS_REGEN_KEY (0x08) — regenerate (replace) the keypair in a slot.
+     * INS_UNBLOCK_CARD (0xA3) — unblock a blocked PIN using the PUK.
      *
-     * **BREAKING CHANGE:** Now requires PIN verification and explicit flag setting.
+     * P1 = PUK length in bytes.
+     * Data = [PUK bytes] || [new PIN bytes].
      *
-     * APDU Format: [PIN_LEN][PIN][FLAGS]
-     * - PIN_LEN: 1 byte (range: 1-8)
-     * - PIN: Variable-length PIN data (1-8 bytes)
-     * - FLAGS: Security flags byte (explicit, not preserved from previous key)
-     *
-     * P1 = slot (0–3)
-     * P2 = reserved (must be 0x00)
-     * Data = PIN length + PIN bytes + flags byte
-     * Response = new 65-byte uncompressed public key
-     *
-     * Security Policy:
-     * - Requires PIN verification before proceeding
-     * - Replaces existing key (if any) without slot occupancy check
-     * - Sets flags explicitly from APDU (does NOT preserve previous flags)
-     *
-     * Returns:
-     * - SW_SECURITY_STATUS_NOT_SATISFIED (0x6982): PIN verification failed
-     * - SW_WRONG_DATA (0x6A80): Invalid flags (reserved bits set)
-     * - SW_WRONG_LENGTH (0x6700): Invalid APDU or PIN length
-     * - SW_9000: Success + new public key in response
-     *
-     * Transaction Safety: Key replacement and flag setting are atomic.
-     * Implementation: Generates fresh P-256 keypair with proper domain parameters.
+     * Resets the PIN try counter and sets the new PIN value.
+     * If the PUK itself is blocked (tries exhausted), returns SW_PIN_BLOCKED;
+     * the only recovery at that point is INS_RESET_CARD.
      */
-    private void handleRegenKey(APDU apdu) {
-        byte[] buf = apdu.getBuffer();
-        byte slot = buf[ISO7816.OFFSET_P1];
-        checkSlot(slot);
-
-        // Parse APDU: [PIN_LEN][PIN][FLAGS]
-        short dataLen = apdu.setIncomingAndReceive();
-        if (dataLen < 2) {
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        }
-
-        byte pinLen = buf[ISO7816.OFFSET_CDATA];
-        if (pinLen < 1 || pinLen > PIN_MAX_LEN) {
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        }
-
-        // Verify total data length
-        if (dataLen != (short) (1 + pinLen + 1)) {
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        }
-
-        // Verify PIN (may decrement counter)
-        if (!pin.check(buf, (short) (ISO7816.OFFSET_CDATA + 1), pinLen)) {
-            ISOException.throwIt(
-                APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED
-            );
-        }
-
-        // Extract flags
-        byte flags = buf[ISO7816.OFFSET_CDATA + 1 + pinLen];
-        validateFlags(flags);
-
-        // Atomic regeneration
-        JCSystem.beginTransaction();
-        try {
-            KeyPair kp = makeP256KeyPair(); // Fixed: Remove duplicate genKeyPair() call
-            keyPairs[slot] = kp;
-            keyFlags[slot] = flags; // Explicit flags, not preserved
-            JCSystem.commitTransaction();
-        } catch (ISOException iso) {
-            JCSystem.abortTransaction();
-            throw iso; // Preserve ISO exceptions
-        } catch (Exception e) {
-            JCSystem.abortTransaction();
-            ISOException.throwIt(ISO7816.SW_UNKNOWN); // Convert to proper 0x6F00
-        }
-
-        // Return new public key
-        returnUncompressedPublicKey(apdu, keyPairs[slot]);
-    }
-
-    /**
-     * INS_CLEAR_KEY (0x0A) — clear key material and flags in a slot.
-     *
-     * Securely delete key and reset flags.
-     *
-     * APDU Format: [PIN_LEN][PIN][FLAGS]
-     * - PIN_LEN: 1 byte (range: 1-8)
-     * - PIN: Variable-length PIN data (1-8 bytes)
-     * - FLAGS: Present for format consistency but ignored
-     *
-     * P1 = slot (0–3)
-     * P2 = reserved (must be 0x00)
-     * Data = PIN length + PIN bytes + flags byte (flags ignored)
-     *
-     * Security Policy:
-     * - Requires PIN verification before proceeding
-     * - Clears private and public key material using clearKey()
-     * - Resets slot flags to 0x00
-     * - Safe to call on empty slots (no error)
-     *
-     * Returns:
-     * - SW_SECURITY_STATUS_NOT_SATISFIED (0x6982): PIN verification failed
-     * - SW_WRONG_DATA (0x6A80): Invalid flags (reserved bits set)
-     * - SW_WRONG_LENGTH (0x6700): Invalid APDU or PIN length
-     * - SW_9000: Success
-     *
-     * Transaction Safety: Key clearing and flag reset are atomic.
-     * Implementation: Uses JavaCard clearKey() for secure key material deletion.
-     */
-    private void handleClearKey(APDU apdu) {
-        byte[] buf = apdu.getBuffer();
-        byte slot = buf[ISO7816.OFFSET_P1];
-        checkSlot(slot);
-
-        // Parse APDU: [PIN_LEN][PIN][FLAGS]
-        short dataLen = apdu.setIncomingAndReceive();
-        if (dataLen < 2) {
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        }
-
-        byte pinLen = buf[ISO7816.OFFSET_CDATA];
-        if (pinLen < 1 || pinLen > PIN_MAX_LEN) {
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        }
-
-        // Verify total data length
-        if (dataLen != (short) (1 + pinLen + 1)) {
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        }
-
-        // Verify PIN
-        if (!pin.check(buf, (short) (ISO7816.OFFSET_CDATA + 1), pinLen)) {
-            ISOException.throwIt(
-                APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED
-            );
-        }
-
-        // Extract and validate flags (ignored but must be valid for format consistency)
-        byte flags = buf[ISO7816.OFFSET_CDATA + 1 + pinLen];
-        validateFlags(flags);
-
-        // Clear key and flags atomically
-        JCSystem.beginTransaction();
-        try {
-            if (keyPairs[slot] != null) {
-                keyPairs[slot].getPrivate().clearKey();
-                keyPairs[slot].getPublic().clearKey();
-                keyPairs[slot] = null;
-            }
-            keyFlags[slot] = 0; // Explicit flag clearing
-            JCSystem.commitTransaction();
-        } catch (ISOException iso) {
-            JCSystem.abortTransaction();
-            throw iso; // Preserve ISO exceptions
-        } catch (Exception e) {
-            JCSystem.abortTransaction();
-            ISOException.throwIt(ISO7816.SW_UNKNOWN); // Convert to proper 0x6F00
-        }
-    }
-
-    /**
-     * INS_UNBLOCK_PIN (0x09) — unblock the PIN using the PUK.
-     * P1 = length of the PUK.
-     * Data = PUK bytes || new PIN bytes.
-     */
-    private void handleUnblockPIN(APDU apdu) {
+    private void handleUnblockCard(APDU apdu) {
         byte[] buf = apdu.getBuffer();
         byte pukLen = buf[ISO7816.OFFSET_P1];
         short totalLen = apdu.setIncomingAndReceive();
@@ -671,18 +667,15 @@ public class SSHKeyApplet extends Applet {
         byte newPINLen = (byte) (totalLen - pukLen);
 
         if (puk.getTriesRemaining() == 0) {
-            // PUK is also blocked — card is permanently locked.
             ISOException.throwIt(APDUConstants.SW_PIN_BLOCKED);
         }
 
         if (!puk.check(buf, ISO7816.OFFSET_CDATA, pukLen)) {
             ISOException.throwIt(
-                (short) (APDUConstants.SW_WRONG_PIN_BASE |
-                    puk.getTriesRemaining())
+                (short) (APDUConstants.SW_WRONG_PIN_BASE | puk.getTriesRemaining())
             );
         }
 
-        // PUK accepted — reset and unblock the PIN, then set the new value.
         JCSystem.beginTransaction();
         try {
             pin.resetAndUnblock();
@@ -692,49 +685,120 @@ public class SSHKeyApplet extends Applet {
             JCSystem.abortTransaction();
             throw e;
         }
-        // Success: SW 9000 sent automatically.
+        // Success — SW 9000 sent automatically.
     }
 
-    // -------------------------------------------------------------------------
+    /**
+     * INS_RESET_CARD (0xA4) — factory reset, two-phase.
+     *
+     * This is the "I forgot everything, blow it all away" escape hatch.
+     * No credentials are required.  The two-phase nonce design prevents
+     * accidental resets from a single malformed or replayed APDU.
+     *
+     * **Phase 1** — no data (resetNonce is all zeros):
+     *   Generates a 16-byte cryptographic nonce, stores it in transient memory
+     *   (CLEAR_ON_DESELECT), and returns it to the caller.  Deselecting the
+     *   card before Phase 2 clears the nonce — start over.
+     *
+     * **Phase 2** — Data = 16-byte nonce (resetNonce is non-zero):
+     *   Verifies the nonce with a constant-time comparison.
+     *   - Match: atomically erases all key material, resets PIN/PUK counters,
+     *     and sets initialized = false.
+     *   - Mismatch: immediately invalidates the nonce and returns
+     *     SW_SECURITY_STATUS_NOT_SATISFIED.  No retries without a new Phase 1.
+     */
+    private void handleResetCard(APDU apdu) {
+        if (isResetNonceClear()) {
+            // Phase 1: generate and return a fresh nonce.
+            rng.generateData(resetNonce, (short) 0, RESET_NONCE_LEN);
+
+            apdu.setOutgoing();
+            apdu.setOutgoingLength(RESET_NONCE_LEN);
+            apdu.sendBytesLong(resetNonce, (short) 0, RESET_NONCE_LEN);
+        } else {
+            // Phase 2: verify nonce and, on success, wipe everything.
+            byte[] buf = apdu.getBuffer();
+            short dataLen = apdu.setIncomingAndReceive();
+
+            if (dataLen != RESET_NONCE_LEN) {
+                // Wrong length — zero nonce immediately, no retries.
+                Util.arrayFillNonAtomic(resetNonce, (short) 0, RESET_NONCE_LEN, (byte) 0);
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+
+            // Util.arrayCompare is constant-time on compliant JC implementations.
+            if (Util.arrayCompare(
+                    buf, ISO7816.OFFSET_CDATA,
+                    resetNonce, (short) 0,
+                    RESET_NONCE_LEN) != 0) {
+                // Wrong nonce — zero immediately, no retries.
+                Util.arrayFillNonAtomic(resetNonce, (short) 0, RESET_NONCE_LEN, (byte) 0);
+                ISOException.throwIt(APDUConstants.SW_SECURITY_STATUS_NOT_SATISFIED);
+            }
+
+            // Nonce verified — zero before the slow EEPROM writes so it
+            // cannot be recovered if power is lost mid-reset.
+            Util.arrayFillNonAtomic(resetNonce, (short) 0, RESET_NONCE_LEN, (byte) 0);
+
+            // Atomically erase all key material and reset credentials.
+            JCSystem.beginTransaction();
+            try {
+                for (byte i = 0; i < MAX_KEYS; i++) {
+                    if (keyPairs[i] != null) {
+                        keyPairs[i].getPrivate().clearKey();
+                        keyPairs[i].getPublic().clearKey();
+                        keyPairs[i] = null;
+                    }
+                    keyFlags[i] = 0;
+                }
+                // Resets try counters and clears the "validated" session flag.
+                // The PIN/PUK values themselves are now irrelevant — CARD_INIT
+                // will overwrite them on next initialization.
+                pin.resetAndUnblock();
+                puk.resetAndUnblock();
+                initialized = false;
+                JCSystem.commitTransaction();
+            } catch (ISOException iso) {
+                JCSystem.abortTransaction();
+                throw iso;
+            } catch (Exception e) {
+                JCSystem.abortTransaction();
+                ISOException.throwIt(ISO7816.SW_UNKNOWN);
+            }
+            // Success — SW 9000 sent automatically.
+        }
+    }
+
+    // =========================================================================
     // Private helpers
-    // -------------------------------------------------------------------------
+    // =========================================================================
 
     /**
      * Allocate and configure a fresh P-256 KeyPair with proper domain parameters.
      *
-     * @return Initialized P-256 KeyPair ready for cryptographic operations
+     * Uses a two-phase approach: first try the direct KeyPair constructor (most
+     * implementations), then fall back to building keys individually (some older
+     * implementations require curve params before genKeyPair() is called).
      */
     private KeyPair makeP256KeyPair() {
-        // Use JCAlgTest's proven approach for P-256 key generation
         try {
             KeyPair kp = null;
-            
-            // Try JCAlgTest's two-phase approach
+
             try {
-                // Phase 1: Create KeyPair directly
                 kp = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
-                // Apply JCAlgTest's curve initialization approach
                 ensureP256CurveInitialized(kp);
             } catch (Exception e) {
-                // Phase 2: Create individual keys first, then KeyPair
                 ECPrivateKey ecPrivKey = (ECPrivateKey) KeyBuilder.buildKey(
-                    KeyBuilder.TYPE_EC_FP_PRIVATE, 
-                    KeyBuilder.LENGTH_EC_FP_256, 
-                    false
-                );
+                    KeyBuilder.TYPE_EC_FP_PRIVATE, KeyBuilder.LENGTH_EC_FP_256, false);
                 ECPublicKey ecPubKey = (ECPublicKey) KeyBuilder.buildKey(
-                    KeyBuilder.TYPE_EC_FP_PUBLIC, 
-                    KeyBuilder.LENGTH_EC_FP_256, 
-                    false
-                );
-                
-                if ((ecPrivKey != null) && (ecPubKey != null)) {
-                    // Set curve parameters on individual keys
+                    KeyBuilder.TYPE_EC_FP_PUBLIC, KeyBuilder.LENGTH_EC_FP_256, false);
+
+                if (ecPrivKey != null && ecPubKey != null) {
                     setP256CurveParams(ecPubKey, ecPrivKey);
                     kp = new KeyPair(ecPubKey, ecPrivKey);
                 }
             }
-            
+
             if (kp != null) {
                 kp.genKeyPair();
                 return kp;
@@ -759,92 +823,81 @@ public class SSHKeyApplet extends Applet {
                     ISOException.throwIt(ISO7816.SW_UNKNOWN);
             }
         } catch (Exception e) {
-            // Key generation failed - report proper error
             ISOException.throwIt(ISO7816.SW_UNKNOWN);
         }
-
-        return null; // Never reached
+        return null; // Never reached.
     }
-    
-    // JCAlgTest-inspired curve initialization
+
+    /** JCAlgTest-inspired curve initialization for the two-phase key build path. */
     private void ensureP256CurveInitialized(KeyPair ecKeyPair) {
-        ECPublicKey ecPubKey = (ECPublicKey) ecKeyPair.getPublic();
+        ECPublicKey  ecPubKey  = (ECPublicKey)  ecKeyPair.getPublic();
         ECPrivateKey ecPrivKey = (ECPrivateKey) ecKeyPair.getPrivate();
-        
-        // Some implementations need genKeyPair() called first
+
         try {
             if (ecPubKey == null) {
                 ecKeyPair.genKeyPair();
             }
         } catch (Exception e) {
-            // Intentionally ignore
+            // Intentionally ignored — best-effort pre-init.
         }
-        
-        // Set curve parameters
+
         setP256CurveParams(ecPubKey, ecPrivKey);
     }
-    
-    // Set P-256 curve parameters using JCAlgTest approach
+
+    /** Set NIST P-256 domain parameters on a pub/priv key pair using the JCAlgTest approach. */
     private void setP256CurveParams(ECPublicKey pubKey, ECPrivateKey privKey) {
-        // Use JCAlgTest's exact approach for P-256 parameter setting
-        byte[] auxBuffer = new byte[80]; // Large enough for uncompressed point
-        
-        // Prepare ANSI X9.62 uncompressed EC point representation for G
-        // Format: 0x04 || G_X || G_Y
-        auxBuffer[0] = 0x04; // Uncompressed point indicator
+        // Build the uncompressed generator point G = 0x04 || G_X || G_Y in a
+        // local scratch buffer.  ROM constants avoid EEPROM wear.
+        byte[] auxBuffer = new byte[80];
+        auxBuffer[0] = 0x04;
         short off = 1;
-        
-        // Copy G_X coordinates
-        off = Util.arrayCopyNonAtomic(ECParams.P256_G_X, (short) 0, auxBuffer, off, (short) ECParams.P256_G_X.length);
-        // Copy G_Y coordinates  
-        Util.arrayCopyNonAtomic(ECParams.P256_G_Y, (short) 0, auxBuffer, off, (short) ECParams.P256_G_Y.length);
-        
-        short gSize = (short)(1 + ECParams.P256_G_X.length + ECParams.P256_G_Y.length);
-        
-        try {
-            // Set field parameters on both keys
-            pubKey.setFieldFP(ECParams.P256_P, (short) 0, (short) ECParams.P256_P.length);
-            privKey.setFieldFP(ECParams.P256_P, (short) 0, (short) ECParams.P256_P.length);
-            
-            // Set curve parameters A and B
-            pubKey.setA(ECParams.P256_A, (short) 0, (short) ECParams.P256_A.length);
-            privKey.setA(ECParams.P256_A, (short) 0, (short) ECParams.P256_A.length);
-            pubKey.setB(ECParams.P256_B, (short) 0, (short) ECParams.P256_B.length);
-            privKey.setB(ECParams.P256_B, (short) 0, (short) ECParams.P256_B.length);
-            
-            // Set generator point G in uncompressed format
-            pubKey.setG(auxBuffer, (short) 0, gSize);
-            privKey.setG(auxBuffer, (short) 0, gSize);
-            
-            // Set order R and cofactor K
-            pubKey.setR(ECParams.P256_R, (short) 0, (short) ECParams.P256_R.length);
-            privKey.setR(ECParams.P256_R, (short) 0, (short) ECParams.P256_R.length);
-            pubKey.setK(ECParams.P256_K);
-            privKey.setK(ECParams.P256_K);
-        } catch (CryptoException e) {
-            // If parameter setting fails, let it bubble up to the caller
-            throw e;
-        }
+        off = Util.arrayCopyNonAtomic(ECParams.P256_G_X, (short) 0, auxBuffer, off,
+                                      (short) ECParams.P256_G_X.length);
+        Util.arrayCopyNonAtomic(ECParams.P256_G_Y, (short) 0, auxBuffer, off,
+                                (short) ECParams.P256_G_Y.length);
+        short gSize = (short) (1 + ECParams.P256_G_X.length + ECParams.P256_G_Y.length);
+
+        pubKey.setFieldFP(ECParams.P256_P, (short) 0, (short) ECParams.P256_P.length);
+        privKey.setFieldFP(ECParams.P256_P, (short) 0, (short) ECParams.P256_P.length);
+        pubKey.setA(ECParams.P256_A, (short) 0, (short) ECParams.P256_A.length);
+        privKey.setA(ECParams.P256_A, (short) 0, (short) ECParams.P256_A.length);
+        pubKey.setB(ECParams.P256_B, (short) 0, (short) ECParams.P256_B.length);
+        privKey.setB(ECParams.P256_B, (short) 0, (short) ECParams.P256_B.length);
+        pubKey.setG(auxBuffer, (short) 0, gSize);
+        privKey.setG(auxBuffer, (short) 0, gSize);
+        pubKey.setR(ECParams.P256_R, (short) 0, (short) ECParams.P256_R.length);
+        privKey.setR(ECParams.P256_R, (short) 0, (short) ECParams.P256_R.length);
+        pubKey.setK(ECParams.P256_K);
+        privKey.setK(ECParams.P256_K);
     }
 
     /**
-     * Erase private and public key material for every slot that has
-     * FLAG_ERASE_ON_LOCK set. Wrapped in a transaction for atomicity in case
-     * of power loss mid-operation.
-     *
-     * Called when the PIN becomes blocked. CLAUDE.md §ERASE_ON_LOCK Behavior.
+     * Returns true if the reset nonce is all zeros (i.e. no Phase 1 has been
+     * issued this session).  CLEAR_ON_DESELECT guarantees the array starts zeroed
+     * each session; we also zero it explicitly after use or on mismatch.
+     */
+    private boolean isResetNonceClear() {
+        for (short i = 0; i < RESET_NONCE_LEN; i++) {
+            if (resetNonce[i] != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Erase private and public key material for every slot with FLAG_ERASE_ON_LOCK.
+     * Wrapped in a transaction for atomicity across potential power loss.
+     * Called when the PIN try counter reaches zero.
      */
     private void eraseLockedKeys() {
         JCSystem.beginTransaction();
         try {
-            for (byte slotIndex = 0; slotIndex < MAX_KEYS; slotIndex++) {
-                if (
-                    (keyFlags[slotIndex] & APDUConstants.FLAG_ERASE_ON_LOCK) !=
-                        0 &&
-                    keyPairs[slotIndex] != null
-                ) {
-                    keyPairs[slotIndex].getPrivate().clearKey();
-                    keyPairs[slotIndex].getPublic().clearKey();
+            for (byte i = 0; i < MAX_KEYS; i++) {
+                if ((keyFlags[i] & APDUConstants.FLAG_ERASE_ON_LOCK) != 0 &&
+                    keyPairs[i] != null) {
+                    keyPairs[i].getPrivate().clearKey();
+                    keyPairs[i].getPublic().clearKey();
                 }
             }
             JCSystem.commitTransaction();
@@ -853,78 +906,40 @@ public class SSHKeyApplet extends Applet {
             throw e;
         }
     }
-    
+
     /**
-     * Helper method to return the uncompressed public key from a KeyPair via APDU response.
-     * Used by key generation operations to return the generated public key as convenience.
-     *
-     * @param apdu The APDU object for sending the response
-     * @param keyPair The KeyPair containing the public key to return
+     * Send the uncompressed public key from a KeyPair as the APDU response.
+     * Used by key-generation operations to return the generated public key.
      */
     private void returnUncompressedPublicKey(APDU apdu, KeyPair keyPair) {
         ECPublicKey pubKey = (ECPublicKey) keyPair.getPublic();
         short keyLen = pubKey.getW(pubKeyScratch, (short) 0);
-        
         apdu.setOutgoing();
         apdu.setOutgoingLength(keyLen);
         apdu.sendBytesLong(pubKeyScratch, (short) 0, keyLen);
     }
 
-    /** Throw if slot is out of range. */
+    /** Throw SW_INCORRECT_P1P2 if the slot index is out of range. */
     private void checkSlot(byte slot) {
         if (slot < 0 || slot >= MAX_KEYS) {
             ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
         }
     }
 
-    /** Throw if the slot has no initialised private key. */
+    /** Throw SW_KEY_NOT_FOUND if the slot has no initialized private key. */
     private void checkKeyPresent(byte slot) {
-        if (
-            keyPairs[slot] == null ||
-            !keyPairs[slot].getPrivate().isInitialized()
-        ) {
+        if (keyPairs[slot] == null || !keyPairs[slot].getPrivate().isInitialized()) {
             ISOException.throwIt(APDUConstants.SW_KEY_NOT_FOUND);
         }
     }
 
     /**
-     * INS_GET_FLAGS (0x11) — return the flags byte for a specified slot.
-     * P1 = slot (0-3), P2 = unused, no data.
-     * Response = 1-byte flags value.
-     * No PIN verification required (read-only operation).
-     */
-    private void handleGetFlags(APDU apdu) {
-        byte slot = apdu.getBuffer()[ISO7816.OFFSET_P1];
-        checkSlot(slot);        // Validate slot range (0-3)
-        checkKeyPresent(slot);  // Ensure slot has a key
-
-        byte[] buf = apdu.getBuffer();
-        buf[0] = keyFlags[slot];  // Return flags for this slot
-        apdu.setOutgoing();
-        apdu.setOutgoingLength((short) 1);
-        apdu.sendBytes((short) 0, (short) 1);
-    }
-
-    /**
-     * Validates security flags, rejecting reserved bits for future compatibility.
-     *
-     * Flag Layout (bits 7-0):
-     * - Bit 7: FLAG_REQUIRE_PIN (0x80)
-     * - Bits 6-4: FLAG_TIMEOUT (0x70, timeout in minutes 0-7)
-     * - Bit 3: FLAG_ERASE_ON_LOCK (0x08)
-     * - Bits 2-0: Reserved for future use (MUST be 0)
-     *
-     * @param flags The flags byte to validate
-     * @throws ISOException with SW_WRONG_DATA (0x6A80) if reserved bits are set
-     *
-     * Implementation Notes:
-     * - Enforces reserved bit constraint for forward compatibility
-     * - Called by all PIN-protected write operations
-     * - Ensures consistent flag validation across operations
+     * Validate that a flags byte has no reserved bits set.
+     * Bits 2–0 are reserved; setting them is rejected to preserve
+     * forward compatibility.
      */
     private void validateFlags(byte flags) {
         if ((flags & 0x07) != 0) {
-            // Check reserved bits 0-2
             ISOException.throwIt(ISO7816.SW_WRONG_DATA);
         }
     }
