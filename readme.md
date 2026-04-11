@@ -14,6 +14,11 @@ I have done the barest of testing to make this work.
 
 - **Mokapot** — JavaCard applet running on the card (AID: CA:FE:4D:6F:6B:61)
 - **Barista** — Go host-side SSH agent that communicates with the card
+- **crema** - Go tool that integrates with Git for signing commits
+
+> [!note] That AID/RID has never been registered with the silly authority that is in an as yet unassigned area of the RID space.
+> Like USB VIDs and PIDs, they're there to keep your local system from getting confused. Both are just lies at different scales.
+> If you somehow managed to put this onto your credit card, I want to know about it because that's cool as shit.
 
 ## Features
 
@@ -153,8 +158,11 @@ SSH_ASKPASS='echo 1234' barista serve
 ```bash
 # Configure Git for SSH signing
 git config --global gpg.format ssh
-git config --global user.signingKey "$(barista keys list -q | head -1)"
+git config --global user.signingKey "..."
 git config --global commit.gpgSign true
+git config --global gpg.ssh.program /path/to/crema
+
+
 
 # Test signing
 git commit -S -m "test signed commit"
@@ -162,8 +170,7 @@ git commit -S -m "test signed commit"
 
 ## Build Requirements
 
-- **JavaCard SDK 3.2.0v25.1** (set JC_HOME environment variable - newer converter supports ARM64)
-- **Java 21+** (set JAVA_HOME environment variable)
+- **Java 21+** (make sure you have the executable /usr/libexec/java_home)
 - **Go 1.23+**
 - **Apache Ant** (for JavaCard build)
 - **just** command runner

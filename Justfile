@@ -1,20 +1,30 @@
+set dotenv-load := true
+
 default:
     @just --list
 
 
-# Both env vars are required:
-#   JAVA_HOME — must point to Java 21 LTS
-#   JC_HOME   — must point to JavaCard SDK 3.2.0v25.1 (newer converter supports ARM64)
-#JAVA_HOME := env("JAVA_HOME")
-JC_HOME   := env("JC_HOME")
+export JAVA_HOME := shell('/usr/libexec/java_home', '-v', env("JAVA_VERSION"))
+export JC_HOME :=  join(justfile_directory(), 'sdks', env("JC"))
 
 buildApplet:
+    @echo "Java Home: ${JAVA_HOME}"
+    @echo "JC Home: ${JC_HOME}"
     cd mokapot && ant clean && ant build
 
 testApplet:
     cd mokapot && ant test
 
 buildClient:
-    cd barista && go build .
+    #!/usr/bin/env sh
+    cd barista
+    echo "Tidy gomod..."
+    go mod tidy
+    [[ -f barista ]] && rm barista
+    [[ -f crema ]] && rm crema
+    echo "Building Barista..."
+    go build ./cmd/barista
+    echo "Building Crema..."
+    go build ./cmd/crema
 
 all: buildApplet buildClient

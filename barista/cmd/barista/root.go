@@ -1,5 +1,5 @@
 // Package cmd contains the cobra command tree for the barista CLI.
-package cmd
+package barista
 
 import (
 	"fmt"
