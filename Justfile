@@ -23,8 +23,8 @@ buildClient:
     [[ -f barista ]] && rm barista
     [[ -f crema ]] && rm crema
     echo "Building Barista..."
-    go build ./cmd/barista
+    go build ./bin/barista
     echo "Building Crema..."
-    go build ./cmd/crema
+    go build ./bin/crema
 
 all: buildApplet buildClient

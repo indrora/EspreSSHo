@@ -44,6 +44,18 @@ Use --verbose for detailed information or --quiet for just the public keys.`,
 			return nil
 		}
 
+		ks, err := cardConn.ListKeys()
+
+		for _, k := range ks {
+			_, err := fmt.Print(k)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: Failed to print key info: %v\n", err)
+			}
+			fmt.Println()
+		}
+
+		fmt.Printf("Found %d keys!", len(ks))
+
 		for slotIndex := byte(0); slotIndex < 4; slotIndex++ {
 			if mask&(1<<slotIndex) == 0 {
 				continue
