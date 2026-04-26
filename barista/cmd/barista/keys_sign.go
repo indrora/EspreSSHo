@@ -10,8 +10,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/indrora/EspreSSHo/barista/card"
-	"github.com/indrora/EspreSSHo/barista/crypto"
+	"github.com/indrora/EspreSSHo/barista/internal/card"
+	"github.com/indrora/EspreSSHo/barista/internal/crypto"
 )
 
 var signCmdRoot = &cobra.Command{

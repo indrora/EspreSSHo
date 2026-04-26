@@ -6,8 +6,8 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/indrora/EspreSSHo/barista/card"
-	"github.com/indrora/EspreSSHo/barista/crypto"
+	"github.com/indrora/EspreSSHo/barista/internal/card"
+	"github.com/indrora/EspreSSHo/barista/internal/crypto"
 )
 
 var statusCmd = &cobra.Command{

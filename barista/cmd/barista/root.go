@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/indrora/EspreSSHo/barista/card"
+	"github.com/indrora/EspreSSHo/barista/internal/card"
 )
 
 // readerFlag is the value of the persistent --reader flag, shared by all subcommands.
