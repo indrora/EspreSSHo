@@ -1,7 +1,7 @@
 package main
 
-import "fmt"
+import "github.com/indrora/EspreSSHo/barista/cmd/crema"
 
 func main() {
-	fmt.Println("TODO: Implement")
+	crema.Execute()
 }
