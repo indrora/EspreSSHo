@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/indrora/EspreSSHo/barista/card"
+	"github.com/indrora/EspreSSHo/barista/internal/card"
 )
 
 // readerFlag is the value of the persistent --reader flag, shared by all subcommands.
@@ -20,9 +20,9 @@ var pukFlag string
 // rootCmd is the top-level cobra command.
 var rootCmd = &cobra.Command{
 	Use:   "barista",
-	Short: "SSH agent backed by a Mokapot JavaCard smart card",
-	Long: `barista connects to a Mokapot JavaCard applet over PC/SC and exposes its
-EC P-256 keys as an SSH agent. Private keys never leave the card.`,
+	Short: "Key and PIN management for Mokapot JavaCard",
+	Long: `barista manages keys and PINs on a Mokapot JavaCard applet over PC/SC.
+Use crema for SSH agent functionality.`,
 }
 
 // Execute is the entry point called from main.
@@ -70,7 +70,6 @@ func init() {
 		},
 	})
 
-	rootCmd.AddCommand(serveCmd)
 	rootCmd.AddCommand(keysCmd)
 	rootCmd.AddCommand(pinCmd)
 }
