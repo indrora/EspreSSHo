@@ -2,3 +2,4 @@ mokapot/util/**
 mokapot/build/**
 .claude/settings.local.json
 barista/barista
+.claude/
