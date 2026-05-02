@@ -133,7 +133,7 @@ public class SSHKeyApplet extends Applet {
         // initialized defaults to false (EEPROM boolean zero-initialisation).
 
         signer = Signature.getInstance(Signature.ALG_ECDSA_SHA_256, false);
-        rng = RandomData.getInstance(RandomData.ALG_TRNG);
+        rng = RandomData.getInstance(Random.RNG_TYPE);
 
         pubKeyScratch = JCSystem.makeTransientByteArray(
             PUBKEY_LEN,
@@ -734,10 +734,11 @@ public class SSHKeyApplet extends Applet {
      *   - Mismatch: immediately invalidates the nonce and returns
      *     SW_SECURITY_STATUS_NOT_SATISFIED.  No retries without a new Phase 1.
      */
+    @SuppressWarnings("deprecation")
     private void handleResetCard(APDU apdu) {
         if (isResetNonceClear()) {
             // Phase 1: generate and return a fresh nonce.
-            rng.nextBytes(resetNonce, (short) 0, RESET_NONCE_LEN);
+            rng.generateData(resetNonce, (short) 0, RESET_NONCE_LEN);
 
             apdu.setOutgoing();
             apdu.setOutgoingLength(RESET_NONCE_LEN);

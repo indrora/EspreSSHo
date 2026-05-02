@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-8" ?>
+<?xml version="1.0" encoding="UTF-8"?>
 <!--
   Mokapot — JavaCard 3.0.5 applet build using SDK 3.2.0v25.1
   Uses ant-javacard: https://github.com/martinpaljak/ant-javacard
@@ -39,7 +39,6 @@
     </taskdef>
 
 
-
     <!-- Test dependency directories -->
     <property name="test.lib.dir" value="${basedir}/lib/test" />
 
@@ -64,20 +63,14 @@
         />
     </target>
 
-    <!--
-      compile-tests: compiles applet sources + test sources against JCardEngine.
-      JCardEngine bundles the JavaCard API classes, so no separate SDK is needed
-      for test compilation — only for the cap-conversion build target above.
-    -->
     <target
         name="compile-tests"
         depends="resolve-test"
         description="Compile applet and test sources against JCardEngine"
     >
         <mkdir dir="${basedir}/build/test-classes" />
-        <!-- Applet sources compiled against JCardEngine's JavaCard API -->
         <javac
-            srcdir="${basedir}/src/main/java"
+            srcdir="${basedir}/src/main/java:${basedir}/src/modern"
             destdir="${basedir}/build/test-classes"
             includeantruntime="false"
         >
@@ -85,7 +78,7 @@
         </javac>
         <!-- Test sources compiled against JCardEngine + compiled applet classes -->
         <javac
-            srcdir="${basedir}/src/test/java"
+            srcdir="${basedir}/src/test/java:${basedir}/src/modern"
             destdir="${basedir}/build/test-classes"
             includeantruntime="false"
         >
@@ -132,6 +125,8 @@
                 package="com.espressho.mokapot"
                 version="1.0"
                 output="${basedir}/build/mokapot-%v.cap"
+                sources="${basedir}/src/modern;${basedir}/src/main/java"
+
             >
                 <applet
                     class="com.espressho.mokapot.SSHKeyApplet"
@@ -146,13 +141,42 @@
                 output="${basedir}/build/mokapot-release-%v.cap"
                 strip="true"
                 debug="false"
+                sources="${basedir}/src/modern;${basedir}/src/main/java"
             >
                 <applet
                     class="com.espressho.mokapot.SSHKeyApplet"
                     aid="${applet.aid}"
                 />
             </cap>
+            <cap
+                targetsdk="3.0.4"
+                aid="${applet.rid}"
+                package="com.espressho.mokapot"
+                version="1.0"
+                output="${basedir}/build/mokapot-legacy-%v.cap"
+                sources="${basedir}/src/legacy;${basedir}/src/main/java"
+            >
 
+                <applet
+                    class="com.espressho.mokapot.SSHKeyApplet"
+                    aid="${applet.aid}"
+                />
+            </cap>
+            <cap
+                aid="${applet.rid}"
+                targetsdk="3.0.4"
+                package="com.espressho.mokapot"
+                version="1.0"
+                output="${basedir}/build/mokapot-release-legacy-%v.cap"
+                strip="true"
+                debug="false"
+                sources="${basedir}/src/legacy;${basedir}/src/main/java"
+            >
+                <applet
+                    class="com.espressho.mokapot.SSHKeyApplet"
+                    aid="${applet.aid}"
+                />
+            </cap>
         </javacard>
     </target>
 
