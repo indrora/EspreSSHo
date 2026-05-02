@@ -3,3 +3,4 @@ mokapot/build/**
 .claude/settings.local.json
 barista/barista
 .claude/
+gp.jar
